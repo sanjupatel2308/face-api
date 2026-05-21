@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+registered_faces/
+temp_*.jpg
+face_encodings.json
+.env
