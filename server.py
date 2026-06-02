@@ -1,3 +1,784 @@
+# from flask import Flask, request, jsonify
+# from flask_cors import CORS
+# from deepface import DeepFace
+# import base64
+# import os
+# import json
+# import shutil
+# import uuid
+# import numpy as np
+# import cv2
+# from datetime import datetime
+
+# # ========= MEDIAPIPE (LIVENESS) =========
+# try:
+#     import mediapipe as mp
+#     mp_face_mesh = mp.solutions.face_mesh
+#     face_mesh = mp_face_mesh.FaceMesh(
+#         static_image_mode=True,
+#         max_num_faces=1,
+#         refine_landmarks=True,
+#         min_detection_confidence=0.3  # 0.3 for low quality images
+#     )
+#     MEDIAPIPE_OK = True
+#     print("✅ MediaPipe loaded")
+# except Exception as e:
+#     MEDIAPIPE_OK = False
+#     mp_face_mesh = None
+#     face_mesh = None
+#     print(f"⚠️  MediaPipe disabled: {e}")
+
+# app = Flask(__name__)
+# CORS(app)
+# app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024
+
+# FACES_DIR = 'registered_faces'
+# TMP_DIR = 'temp_files'
+# MODEL = 'VGG-Face'
+# BACKEND = 'opencv'
+# EAR_THRESHOLD = 0.22
+
+# # Anti-spoofing thresholds
+# MIN_FRAMES = 5
+# MAX_FRAMES = 7
+# LAP_THRESHOLD = 60.0
+# AREA_VAR_MIN = 0.03
+# MOIRE_THRESHOLD = 14.0
+# TEMP_STATIC_MAX = 2.5
+# TEMP_JUMP_RATIO = 3.5
+
+# os.makedirs(FACES_DIR, exist_ok=True)
+# os.makedirs(TMP_DIR, exist_ok=True)
+
+# LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+# RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+
+
+# # ==================== HELPERS ====================
+
+# def decode_b64(b64):
+#     if ',' in b64:
+#         b64 = b64.split(',')[1]
+#     return base64.b64decode(b64)
+
+
+# def save_b64(b64, path):
+#     with open(path, 'wb') as f:
+#         f.write(decode_b64(b64))
+
+
+# def tmp_path(prefix='t'):
+#     return os.path.join(TMP_DIR, f'{prefix}_{uuid.uuid4().hex[:12]}.jpg')
+
+
+# def cleanup(*paths):
+#     for p in paths:
+#         try:
+#             if p and os.path.exists(p):
+#                 os.remove(p)
+#         except:
+#             pass
+
+
+# def detect_faces(path):
+#     try:
+#         faces = DeepFace.extract_faces(
+#             img_path=path, detector_backend=BACKEND, enforce_detection=False
+#         )
+#         return [f for f in faces if float(f.get('confidence', 0)) > 0.5]
+#     except:
+#         return []
+
+
+# def calc_ear(landmarks, indices, w, h):
+#     pts = [(int(landmarks.landmark[i].x * w), int(landmarks.landmark[i].y * h)) for i in indices]
+#     v1 = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
+#     v2 = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
+#     horiz = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
+#     return (v1 + v2) / (2.0 * horiz) if horiz > 0 else 0.0
+
+# def eye_state(path):
+#     if not MEDIAPIPE_OK:
+#         return 'error', 'mediapipe not available'
+#     try:
+#         img = cv2.imread(path)
+#         if img is None:
+#             return 'error', 'cant read image'
+#         h, w = img.shape[:2]
+#         if h < 50 or w < 50:
+#             return 'error', f'image too small: {w}x{h}'
+        
+#         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+#         # Use module-level face_mesh instance
+#         res = face_mesh.process(rgb)
+        
+#         if not res or not res.multi_face_landmarks:
+#             return 'error', f'no face landmarks found'
+        
+#         lm = res.multi_face_landmarks[0]
+#         le = calc_ear(lm, LEFT_EYE_IDX, w, h)
+#         re = calc_ear(lm, RIGHT_EYE_IDX, w, h)
+#         avg = (le + re) / 2.0
+#         state = 'closed' if avg < EAR_THRESHOLD else 'open'
+#         return state, f'EAR={avg:.3f}'
+#     except Exception as e:
+#         import traceback
+#         print(f"EYE_STATE ERROR: {str(e)}")
+#         traceback.print_exc()
+#         return 'error', str(e)
+
+# def verify_match(reg_path, live_path):
+#     result = DeepFace.verify(
+#         img1_path=reg_path, img2_path=live_path,
+#         model_name=MODEL, detector_backend=BACKEND,
+#         enforce_detection=True,
+#     )
+#     matched = bool(result.get('verified', False))
+#     dist = float(result.get('distance', 0))
+#     thresh = float(result.get('threshold', 1))
+#     conf = max(0, min(100, (1 - dist / thresh) * 100)) if thresh > 0 else 0
+#     return matched, round(conf, 2), round(dist, 4), round(thresh, 4)
+
+
+# def get_username(uid):
+#     meta = os.path.join(FACES_DIR, uid, 'meta.json')
+#     if os.path.exists(meta):
+#         with open(meta, 'r', encoding='utf-8') as f:
+#             return json.load(f).get('userName', '')
+#     return ''
+
+
+# def get_face_area(path):
+#     try:
+#         faces = DeepFace.extract_faces(
+#             img_path=path, detector_backend=BACKEND, enforce_detection=False
+#         )
+#         if faces:
+#             fa = faces[0].get('facial_area', {})
+#             return float(fa.get('w', 0) * fa.get('h', 0))
+#     except:
+#         pass
+#     return 0.0
+
+
+# def laplacian_variance(path):
+#     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         return 0.0
+#     return float(cv2.Laplacian(img, cv2.CV_64F).var())
+
+
+# def detect_moire(path):
+#     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         return False, 0.0
+#     small = cv2.resize(img, (256, 256))
+#     f = np.fft.fft2(small)
+#     fshift = np.fft.fftshift(f)
+#     magnitude = np.abs(fshift)
+#     rows, cols = small.shape
+#     crow, ccol = rows // 2, cols // 2
+#     mask = np.ones((rows, cols), np.uint8)
+#     r = 20
+#     mask[crow-r:crow+r, ccol-r:ccol+r] = 0
+#     peaks = magnitude * mask
+#     peak_ratio = float(np.max(peaks) / (np.mean(magnitude) + 1e-6))
+#     is_moire = peak_ratio > MOIRE_THRESHOLD
+#     return is_moire, peak_ratio
+
+
+# def temporal_consistency(paths):
+#     diffs = []
+#     for i in range(len(paths) - 1):
+#         img1 = cv2.imread(paths[i], cv2.IMREAD_GRAYSCALE)
+#         img2 = cv2.imread(paths[i+1], cv2.IMREAD_GRAYSCALE)
+#         if img1 is None or img2 is None:
+#             continue
+#         if img1.shape != img2.shape:
+#             img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+#         diff = cv2.absdiff(img1, img2)
+#         mean_diff = float(np.mean(diff))
+#         diffs.append(mean_diff)
+    
+#     if len(diffs) < 2:
+#         return False, {'reason': 'insufficient_frames', 'diffs': diffs}
+    
+#     median_diff = float(np.median(diffs))
+#     max_diff = float(np.max(diffs))
+    
+#     if max_diff < TEMP_STATIC_MAX:
+#         return False, {
+#             'reason': 'completely_static',
+#             'max_diff': max_diff,
+#             'msg': 'No natural motion detected. Real person required.'
+#         }
+    
+#     if max_diff > median_diff * TEMP_JUMP_RATIO and median_diff > 1.0:
+#         return False, {
+#             'reason': 'sudden_jump',
+#             'max_diff': max_diff,
+#             'median_diff': median_diff,
+#             'msg': 'Abnormal frame switch detected (possible photo/video spoof).'
+#         }
+    
+#     return True, {'max_diff': max_diff, 'median_diff': median_diff}
+
+
+# def analyze_blink_sequence(states):
+#     clean = [s for s in states if s in ('open', 'closed')]
+#     if len(clean) < 3:
+#         return False, 'Need at least 3 valid eye-state frames'
+    
+#     if 'closed' not in clean:
+#         return False, 'No eye closure detected. Please blink naturally.'
+    
+#     natural_blink = False
+#     for i in range(1, len(clean) - 1):
+#         if clean[i] == 'closed' and clean[i-1] == 'open' and clean[i+1] == 'open':
+#             natural_blink = True
+#             break
+    
+#     if not natural_blink:
+#         return False, 'Unnatural eye pattern. Blink your eyes normally (open-closed-open).'
+    
+#     transitions = sum(1 for i in range(len(clean)-1) if clean[i] != clean[i+1])
+#     if transitions < 2:
+#         return False, 'Eye movement insufficient'
+#     if transitions > 5:
+#         return False, 'Too many eye state changes (unnatural)'
+    
+#     return True, 'Natural blink verified'
+
+
+# # ==================== ROUTES ====================
+
+# @app.route('/')
+# def index():
+#     return jsonify({
+#         'status': 'running',
+#         'version': '4.0-strong',
+#         'liveness': MEDIAPIPE_OK,
+#         'endpoints': [
+#             '/health', '/face/register', '/face/verify',
+#             '/face/liveness-verify', '/face/liveness-verify-strong',
+#             '/face/check-eyes', '/face/delete', '/face/list'
+#         ]
+#     })
+
+
+# @app.route('/health')
+# def health():
+#     return jsonify({'success': True, 'liveness': MEDIAPIPE_OK, 'time': datetime.now().isoformat()})
+
+
+# @app.route('/face/register', methods=['POST'])
+# def register():
+#     try:
+#         d = request.json or {}
+#         uid = (d.get('userId') or '').strip()
+#         name = (d.get('name') or d.get('userName') or '').strip()
+#         b64 = d.get('imageBase64') or d.get('image') or ''
+
+#         if not uid or not b64:
+#             return jsonify({'success': False, 'msg': 'userId + imageBase64 required'}), 400
+
+#         udir = os.path.join(FACES_DIR, uid)
+#         os.makedirs(udir, exist_ok=True)
+#         fpath = os.path.join(udir, 'face.jpg')
+#         save_b64(b64, fpath)
+
+#         faces = detect_faces(fpath)
+#         if len(faces) == 0:
+#             os.remove(fpath)
+#             return jsonify({'success': False, 'msg': 'No face detected'})
+#         if len(faces) > 1:
+#             os.remove(fpath)
+#             return jsonify({'success': False, 'msg': 'Multiple faces — only 1 allowed'})
+
+#         with open(os.path.join(udir, 'meta.json'), 'w', encoding='utf-8') as f:
+#             json.dump({'userId': uid, 'userName': name, 'at': datetime.now().isoformat()}, f, indent=2)
+
+#         return jsonify({'success': True, 'msg': f'{name or uid} registered OK', 'userId': uid})
+#     except Exception as e:
+#         return jsonify({'success': False, 'msg': str(e)}), 500
+
+
+# @app.route('/face/verify', methods=['POST'])
+# def verify():
+#     t = None
+#     try:
+#         d = request.json or {}
+#         uid = (d.get('userId') or '').strip()
+#         b64 = d.get('imageBase64') or d.get('image') or ''
+
+#         if not uid or not b64:
+#             return jsonify({'success': False, 'matched': False, 'msg': 'userId + image required'}), 400
+
+#         reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+#         if not os.path.exists(reg):
+#             return jsonify({'success': False, 'matched': False, 'msg': 'Face not registered'})
+
+#         t = tmp_path('v')
+#         save_b64(b64, t)
+
+#         faces = detect_faces(t)
+#         if len(faces) == 0:
+#             return jsonify({'success': False, 'matched': False, 'msg': 'No face detected'})
+#         if len(faces) > 1:
+#             return jsonify({'success': False, 'matched': False, 'msg': 'Multiple faces'})
+
+#         matched, conf, dist, thresh = verify_match(reg, t)
+#         return jsonify({
+#             'success': True, 'matched': matched,
+#             'confidence': conf, 'distance': dist, 'threshold': thresh,
+#             'userName': get_username(uid),
+#             'msg': f'Matched {conf}%' if matched else f'Not matched {conf}%'
+#         })
+#     except Exception as e:
+#         return jsonify({'success': False, 'matched': False, 'msg': str(e)}), 500
+#     finally:
+#         cleanup(t)
+
+
+# @app.route('/face/check-eyes', methods=['POST'])
+# def check_eyes():
+#     t = None
+#     try:
+#         if not MEDIAPIPE_OK:
+#             return jsonify({'success': False, 'msg': 'mediapipe not installed'}), 500
+
+#         d = request.json or {}
+#         b64 = d.get('imageBase64') or ''
+#         if not b64:
+#             return jsonify({'success': False, 'msg': 'image required'}), 400
+
+#         t = tmp_path('eye')
+#         save_b64(b64, t)
+#         state, detail = eye_state(t)
+
+#         return jsonify({'success': state != 'error', 'eyeState': state, 'detail': detail})
+#     except Exception as e:
+#         return jsonify({'success': False, 'msg': str(e)}), 500
+#     finally:
+#         cleanup(t)
+
+
+# @app.route('/face/liveness-verify', methods=['POST'])
+# def liveness_verify():
+#     tc = to = None
+#     try:
+#         d = request.json or {}
+#         uid = (d.get('userId') or '').strip()
+#         b64_closed = d.get('frameClosedBase64') or d.get('frame1') or ''
+#         b64_open = d.get('frameOpenBase64') or d.get('frame2') or ''
+
+#         if not uid:
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'userId required'}), 400
+#         if not b64_closed or not b64_open:
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Both frames required'}), 400
+
+#         reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+#         if not os.path.exists(reg):
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Not registered'})
+
+#         tc = tmp_path('lc')
+#         to = tmp_path('lo')
+#         save_b64(b64_closed, tc)
+#         save_b64(b64_open, to)
+
+#         live_ok = False
+#         live_msg = ''
+
+#         if MEDIAPIPE_OK:
+#             s1, d1 = eye_state(tc)
+#             s2, d2 = eye_state(to)
+
+#             if s1 == 'error':
+#                 live_msg = f'Frame1 error: {d1}'
+#             elif s2 == 'error':
+#                 live_msg = f'Frame2 error: {d2}'
+#             elif s1 == 'closed' and s2 == 'open':
+#                 live_ok = True
+#                 live_msg = f'Blink OK (closed:{d1}, open:{d2})'
+#             elif s1 == 'open' and s2 == 'open':
+#                 live_msg = 'Both frames eyes OPEN — blink not detected'
+#             elif s1 == 'closed' and s2 == 'closed':
+#                 live_msg = 'Both frames eyes CLOSED — open eyes in frame 2'
+#             else:
+#                 live_msg = f'Unexpected: frame1={s1}, frame2={s2}'
+#         else:
+#             live_ok = True
+#             live_msg = 'mediapipe missing — skipped'
+
+#         if not live_ok:
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': False,
+#                 'msg': live_msg, 'step': 'liveness_failed'
+#             })
+
+#         faces = detect_faces(to)
+#         if len(faces) == 0:
+#             return jsonify({'success': True, 'matched': False, 'live': True, 'msg': 'No face in frame 2'})
+
+#         matched, conf, dist, thresh = verify_match(reg, to)
+#         msg = f'Live+Matched {conf}%' if matched else f'Live but NOT matched {conf}%'
+
+#         return jsonify({
+#             'success': True, 'matched': matched, 'live': True,
+#             'confidence': conf, 'distance': dist, 'threshold': thresh,
+#             'userName': get_username(uid),
+#             'msg': msg, 'liveMsg': live_msg,
+#             'time': datetime.now().isoformat()
+#         })
+
+#     except Exception as e:
+#         return jsonify({'success': False, 'matched': False, 'live': False, 'msg': str(e)}), 500
+#     finally:
+#         cleanup(tc, to)
+
+
+# @app.route('/face/liveness-verify-strong', methods=['POST'])
+# def liveness_verify_strong():
+#     temp_paths = []
+#     try:
+#         d = request.json or {}
+#         uid = (d.get('userId') or '').strip()
+#         frames = d.get('framesBase64') or []
+
+#         if not uid:
+#             return jsonify({
+#                 'success': False, 'matched': False, 'live': False,
+#                 'msg': 'userId required', 'layer': 'input'
+#             }), 400
+
+#         if len(frames) < MIN_FRAMES:
+#             return jsonify({
+#                 'success': False, 'matched': False, 'live': False,
+#                 'msg': f'Send {MIN_FRAMES}-{MAX_FRAMES} frames for strong verification',
+#                 'layer': 'input'
+#             }), 400
+
+#         reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+#         if not os.path.exists(reg):
+#             return jsonify({
+#                 'success': False, 'matched': False, 'live': False,
+#                 'msg': 'Face not registered', 'layer': 'registration'
+#             })
+
+#         for i, b64 in enumerate(frames[:MAX_FRAMES]):
+#             p = tmp_path(f'str_{i}')
+#             save_b64(b64, p)
+#             temp_paths.append(p)
+
+#         checks = {
+#             'frames_ok': False,
+#             'blink_natural': False,
+#             'micro_movement': False,
+#             'texture_real': False,
+#             'no_moire': False,
+#             'temporal_smooth': False,
+#             'face_match': False
+#         }
+
+#         # LAYER 1: Single face per frame
+#         face_data = []
+#         for p in temp_paths:
+#             fcs = detect_faces(p)
+#             if len(fcs) != 1:
+#                 cleanup(*temp_paths)
+#                 return jsonify({
+#                     'success': False, 'matched': False, 'live': False,
+#                     'msg': f'Multiple or no face in frame. Exactly 1 face required.',
+#                     'layer': 'face_count',
+#                     'checks': checks
+#                 })
+#             face_data.append({
+#                 'confidence': float(fcs[0].get('confidence', 0)),
+#                 'area': get_face_area(p)
+#             })
+#         checks['frames_ok'] = True
+
+#         # LAYER 2: Natural Blink
+
+#         eye_details = []  # 🆕 Debug ke liye
+#         for p in temp_paths:
+#             if MEDIAPIPE_OK:
+#                 st, det = eye_state(p)
+#             else:
+#                 st, det = 'unknown', 'mediapipe_off'
+#             eye_states.append(st)
+#             eye_details.append(det)  
+
+
+#         blink_ok, blink_msg = analyze_blink_sequence(eye_states)
+#         if not blink_ok:
+#             cleanup(*temp_paths)
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': False,
+#                 'msg': blink_msg,
+#                 'layer': 'blink',
+#                 'eye_sequence': eye_states,
+#                 'checks': checks
+#             })
+#         checks['blink_natural'] = True
+
+#         # LAYER 3: Micro-movement
+#         areas = [fd['area'] for fd in face_data if fd['area'] > 0]
+#         if len(areas) >= 2:
+#             area_variance = (max(areas) - min(areas)) / (max(areas) + 1e-6)
+#             if area_variance < AREA_VAR_MIN:
+#                 cleanup(*temp_paths)
+#                 return jsonify({
+#                     'success': True, 'matched': False, 'live': False,
+#                     'msg': 'Static image detected. Real person required (no micro-movement).',
+#                     'layer': 'micro_movement',
+#                     'area_variance': round(area_variance, 4),
+#                     'checks': checks
+#                 })
+#         checks['micro_movement'] = True
+
+#         # LAYER 4: Texture / Depth
+#         lap_vars = [laplacian_variance(p) for p in temp_paths]
+#         avg_lap = float(np.mean(lap_vars))
+#         if avg_lap < LAP_THRESHOLD:
+#             cleanup(*temp_paths)
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': False,
+#                 'msg': 'Flat image detected (possible photo/screen). Real 3D face required.',
+#                 'layer': 'texture',
+#                 'laplacian_avg': round(avg_lap, 2),
+#                 'checks': checks
+#             })
+#         checks['texture_real'] = True
+
+#         # LAYER 5: Screen / Moire
+#         for i, p in enumerate(temp_paths):
+#             is_moire, ratio = detect_moire(p)
+#             if is_moire:
+#                 cleanup(*temp_paths)
+#                 return jsonify({
+#                     'success': True, 'matched': False, 'live': False,
+#                     'msg': 'Screen/photo spoof detected (moire pattern). Real person required.',
+#                     'layer': 'moire',
+#                     'frame_index': i,
+#                     'moire_ratio': round(ratio, 2),
+#                     'checks': checks
+#                 })
+#         checks['no_moire'] = True
+
+#         # LAYER 6: Temporal consistency
+#         smooth, temp_info = temporal_consistency(temp_paths)
+#         if not smooth:
+#             cleanup(*temp_paths)
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': False,
+#                 'msg': temp_info.get('msg', 'Unnatural frame sequence.'),
+#                 'layer': 'temporal',
+#                 'details': temp_info,
+#                 'checks': checks
+#             })
+#         checks['temporal_smooth'] = True
+
+#         # LAYER 7: Face Match
+#         best_idx = 0
+#         best_score = -1
+#         for i in range(len(temp_paths)):
+#             conf = face_data[i]['confidence']
+#             eye_ok = eye_states[i] == 'open'
+#             score = conf + (100 if eye_ok else 0)
+#             if score > best_score:
+#                 best_score = score
+#                 best_idx = i
+
+#         matched, conf, dist, thresh = verify_match(reg, temp_paths[best_idx])
+#         checks['face_match'] = matched
+
+#         if not matched:
+#             cleanup(*temp_paths)
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': True,
+#                 'msg': f'Live person verified, but face NOT matched ({conf}%). Register again if needed.',
+#                 'layer': 'face_match',
+#                 'confidence': conf,
+#                 'checks': checks,
+#                 'time': datetime.now().isoformat()
+#             })
+
+#         return jsonify({
+#             'success': True,
+#             'matched': True,
+#             'live': True,
+#             'confidence': conf,
+#             'distance': dist,
+#             'threshold': thresh,
+#             'userName': get_username(uid),
+#             'msg': f'✅ Strong Liveness Passed + Matched ({conf}%)',
+#             'checks': checks,
+#             'eye_sequence': eye_states,
+#             'time': datetime.now().isoformat()
+#         })
+
+#     except Exception as e:
+#         return jsonify({
+#             'success': False, 'matched': False, 'live': False,
+#             'msg': f'Server error: {str(e)}',
+#             'layer': 'exception'
+#         }), 500
+#     finally:
+#         cleanup(*temp_paths)
+
+
+
+# @app.route('/face/auto-verify', methods=['POST'])
+# def auto_verify():
+#     temp_paths = []
+#     try:
+#         d = request.json or {}
+#         uid = (d.get('userId') or '').strip()
+#         frames = d.get('framesBase64') or []
+
+#         if not uid:
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'userId required'}), 400
+#         if len(frames) < 3:
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Need 3 frames'}), 400
+
+#         reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+#         if not os.path.exists(reg):
+#             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Face not registered'}), 400
+
+#         # Save frames
+#         for i, b64 in enumerate(frames[:3]):
+#             p = tmp_path(f'auto_{i}')
+#             save_b64(b64, p)
+#             temp_paths.append(p)
+
+#         # Step 1: Check each frame has exactly 1 face
+#         face_boxes = []
+#         for i, p in enumerate(temp_paths):
+#             try:
+#                 faces = DeepFace.extract_faces(img_path=p, detector_backend=BACKEND, enforce_detection=False)
+#                 valid = [f for f in faces if float(f.get('confidence', 0)) > 0.5]
+#                 if len(valid) != 1:
+#                     cleanup(*temp_paths)
+#                     return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Frame {i+1}: {len(valid)} faces found. Exactly 1 face needed.'}), 400
+#                 fa = valid[0].get('facial_area', {})
+#                 face_boxes.append({'x': fa.get('x',0), 'y': fa.get('y',0), 'w': fa.get('w',0), 'h': fa.get('h',0)})
+#             except Exception as e:
+#                 cleanup(*temp_paths)
+#                 return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Frame {i+1} face detect error: {str(e)}'}), 500
+
+#         # Step 2: Movement check (anti-static/anti-photo)
+#         movements = []
+#         for i in range(len(face_boxes)-1):
+#             dx = abs(face_boxes[i]['x'] - face_boxes[i+1]['x'])
+#             dy = abs(face_boxes[i]['y'] - face_boxes[i+1]['y'])
+#             dw = abs(face_boxes[i]['w'] - face_boxes[i+1]['w'])
+#             dh = abs(face_boxes[i]['h'] - face_boxes[i+1]['h'])
+#             movements.append(dx + dy + dw + dh)
+
+#         avg_movement = sum(movements) / len(movements) if movements else 0
+#         print(f"Auto-verify: avg_movement={avg_movement}")
+
+#         if avg_movement < 1.0:
+#             cleanup(*temp_paths)
+#             return jsonify({'success': True, 'matched': False, 'live': False, 'msg': 'Static image detected. Please hold phone naturally and do not use photos.'}), 200
+
+#         # Step 3: Texture check (Laplacian variance)
+#         lap_scores = [laplacian_variance(p) for p in temp_paths]
+#         avg_lap = sum(lap_scores) / len(lap_scores)
+#         print(f"Auto-verify: avg_lap={avg_lap}")
+
+#         if avg_lap < 30.0:  # Threshold 30 for mobile cameras
+#             cleanup(*temp_paths)
+#             return jsonify({'success': True, 'matched': False, 'live': False, 'msg': 'Flat image detected. Real person required.'}), 200
+
+#         # Step 4: Screen/Moire check (DISABLED - false positives on real faces)
+#         # Mobile camera real faces me bhi FFT peaks aa sakte hain
+#         # Isliye sirf Laplacian + Movement pe rely karte hain
+
+#         # Step 5: Face Match (use middle frame = frame 1)
+#         best_frame = temp_paths[1] if len(temp_paths) >= 2 else temp_paths[0]
+#         result = DeepFace.verify(
+#             img1_path=reg, img2_path=best_frame,
+#             model_name=MODEL, detector_backend=BACKEND,
+#             enforce_detection=False,
+#         )
+
+#         matched = bool(result.get('verified', False))
+#         distance = float(result.get('distance', 0))
+#         threshold = float(result.get('threshold', 1))
+#         confidence = max(0, min(100, (1 - distance / threshold) * 100)) if threshold > 0 else 0
+
+#         if not matched:
+#             cleanup(*temp_paths)
+#             return jsonify({
+#                 'success': True, 'matched': False, 'live': True,
+#                 'confidence': round(confidence, 2),
+#                 'msg': f'Face NOT matched ❌ ({round(confidence,1)}%). Please contact admin to re-register your face.'
+#             }), 200
+
+#         # ALL PASSED
+#         cleanup(*temp_paths)
+#         return jsonify({
+#             'success': True,
+#             'matched': True,
+#             'live': True,
+#             'confidence': round(confidence, 2),
+#             'userName': get_username(uid),
+#             'msg': f'✅ Verified + Matched ({round(confidence,1)}%)',
+#             'time': datetime.now().isoformat()
+#         })
+
+#     except Exception as e:
+#         import traceback
+#         print(f"AUTO_VERIFY CRASH: {str(e)}")
+#         traceback.print_exc()
+#         return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Server error: {str(e)}'}), 500
+#     finally:
+#         cleanup(*temp_paths)
+
+
+# @app.route('/face/delete', methods=['POST'])
+# def delete():
+#     try:
+#         uid = (request.json or {}).get('userId', '').strip()
+#         d = os.path.join(FACES_DIR, uid)
+#         if os.path.exists(d):
+#             shutil.rmtree(d)
+#             return jsonify({'success': True, 'msg': 'Deleted'})
+#         return jsonify({'success': False, 'msg': 'Not found'})
+#     except Exception as e:
+#         return jsonify({'success': False, 'msg': str(e)}), 500
+
+
+# @app.route('/face/list')
+# def list_faces():
+#     users = []
+#     if os.path.exists(FACES_DIR):
+#         for uid in os.listdir(FACES_DIR):
+#             m = os.path.join(FACES_DIR, uid, 'meta.json')
+#             if os.path.exists(m):
+#                 with open(m, 'r', encoding='utf-8') as f:
+#                     users.append(json.load(f))
+#     return jsonify({'success': True, 'count': len(users), 'users': users})
+
+
+# if __name__ == '__main__':
+#     port = int(os.environ.get('PORT', 5000))
+#     print("=" * 60)
+#     print("  FACE + STRONG LIVENESS SERVER v4.0")
+#     print(f"  Port: {port}")
+#     print(f"  Liveness: {'ON' if MEDIAPIPE_OK else 'OFF'}")
+#     print(f"  Faces dir: {os.path.abspath(FACES_DIR)}")
+#     print("=" * 60)
+#     app.run(host='0.0.0.0', port=port, debug=True)
+
+
+
+
+
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepface import DeepFace
@@ -6,344 +787,914 @@ import os
 import json
 import shutil
 import uuid
+import numpy as np
+import cv2
 from datetime import datetime
+
+# ========= MEDIAPIPE (LIVENESS) =========
+try:
+    import mediapipe as mp
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.3
+    )
+    MEDIAPIPE_OK = True
+    print("✅ MediaPipe loaded")
+except Exception as e:
+    MEDIAPIPE_OK = False
+    mp_face_mesh = None
+    face_mesh = None
+    print(f"⚠️ MediaPipe disabled: {e}")
 
 app = Flask(__name__)
 CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
-# ========= CONFIG =========
 FACES_DIR = 'registered_faces'
 TMP_DIR = 'temp_files'
-MODEL_NAME = 'VGG-Face'
-DETECTOR_BACKEND = 'opencv'
+MODEL = 'VGG-Face'
+BACKEND = 'opencv'
+EAR_THRESHOLD = 0.22
+
+# Anti-spoofing thresholds
+MIN_FRAMES = 5
+MAX_FRAMES = 7
+LAP_THRESHOLD = 60.0
+AREA_VAR_MIN = 0.03
+MOIRE_THRESHOLD = 14.0
+TEMP_STATIC_MAX = 2.5
+TEMP_JUMP_RATIO = 3.5
 
 os.makedirs(FACES_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 
-
-# ========= HELPERS =========
-def save_base64_image(base64_string, filepath):
-    """Save base64 image to file"""
-    if not base64_string:
-        raise ValueError("Empty image data")
-
-    if ',' in base64_string:
-        base64_string = base64_string.split(',')[1]
-
-    image_data = base64.b64decode(base64_string)
-    with open(filepath, 'wb') as f:
-        f.write(image_data)
+LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 
 
-def get_image_from_request(data):
-    """Accept both image and imageBase64"""
-    return data.get('imageBase64') or data.get('image') or ''
+# ==================== HELPERS ====================
+
+def decode_b64(b64):
+    if ',' in b64:
+        b64 = b64.split(',')[1]
+    return base64.b64decode(b64)
 
 
-def get_name_from_request(data):
-    """Accept both userName and name"""
-    return data.get('userName') or data.get('name') or ''
+def save_b64(b64, path):
+    with open(path, 'wb') as f:
+        f.write(decode_b64(b64))
 
 
-def count_faces(image_path):
-    """
-    Return exact detected face count.
-    enforce_detection=False so we can safely handle no-face case,
-    but we'll manually validate count.
-    """
-    faces = DeepFace.extract_faces(
-        img_path=image_path,
-        detector_backend=DETECTOR_BACKEND,
-        enforce_detection=False
+def tmp_path(prefix='t'):
+    return os.path.join(TMP_DIR, f'{prefix}_{uuid.uuid4().hex[:12]}.jpg')
+
+
+def cleanup(*paths):
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except:
+            pass
+
+
+def detect_faces(path):
+    try:
+        faces = DeepFace.extract_faces(
+            img_path=path,
+            detector_backend=BACKEND,
+            enforce_detection=False
+        )
+        return [f for f in faces if float(f.get('confidence', 0)) > 0.5]
+    except Exception as e:
+        print(f"detect_faces error: {e}")
+        return []
+
+
+def calc_ear(landmarks, indices, w, h):
+    pts = [(int(landmarks.landmark[i].x * w), int(landmarks.landmark[i].y * h)) for i in indices]
+    v1 = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
+    v2 = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
+    horiz = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
+    return (v1 + v2) / (2.0 * horiz) if horiz > 0 else 0.0
+
+
+def eye_state(path):
+    if not MEDIAPIPE_OK:
+        return 'error', 'mediapipe not available'
+    try:
+        img = cv2.imread(path)
+        if img is None:
+            return 'error', 'cant read image'
+
+        h, w = img.shape[:2]
+        if h < 50 or w < 50:
+            return 'error', f'image too small: {w}x{h}'
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = face_mesh.process(rgb)
+
+        if not res or not res.multi_face_landmarks:
+            return 'error', 'no face landmarks found'
+
+        lm = res.multi_face_landmarks[0]
+        le = calc_ear(lm, LEFT_EYE_IDX, w, h)
+        re = calc_ear(lm, RIGHT_EYE_IDX, w, h)
+        avg = (le + re) / 2.0
+        state = 'closed' if avg < EAR_THRESHOLD else 'open'
+        return state, f'EAR={avg:.3f}'
+    except Exception as e:
+        print(f"EYE_STATE ERROR: {str(e)}")
+        return 'error', str(e)
+
+
+def verify_match(reg_path, live_path):
+    result = DeepFace.verify(
+        img1_path=reg_path,
+        img2_path=live_path,
+        model_name=MODEL,
+        detector_backend=BACKEND,
+        enforce_detection=True,
     )
-
-    valid_faces = [f for f in faces if float(f.get('confidence', 0)) > 0.5]
-    return len(valid_faces), valid_faces
-
-
-def build_temp_path(prefix='temp'):
-    return os.path.join(TMP_DIR, f'{prefix}_{uuid.uuid4().hex}.jpg')
+    matched = bool(result.get('verified', False))
+    dist = float(result.get('distance', 0))
+    thresh = float(result.get('threshold', 1))
+    conf = max(0, min(100, (1 - dist / thresh) * 100)) if thresh > 0 else 0
+    return matched, round(conf, 2), round(dist, 4), round(thresh, 4)
 
 
-# ========= ROUTES =========
-@app.route('/', methods=['GET'])
-def home():
+def get_username(uid):
+    meta = os.path.join(FACES_DIR, uid, 'meta.json')
+    if os.path.exists(meta):
+        with open(meta, 'r', encoding='utf-8') as f:
+            return json.load(f).get('userName', '')
+    return ''
+
+
+def get_face_area(path):
+    try:
+        faces = DeepFace.extract_faces(
+            img_path=path,
+            detector_backend=BACKEND,
+            enforce_detection=False
+        )
+        if faces:
+            fa = faces[0].get('facial_area', {})
+            return float(fa.get('w', 0) * fa.get('h', 0))
+    except Exception as e:
+        print(f"get_face_area error: {e}")
+    return 0.0
+
+
+def laplacian_variance(path):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return 0.0
+    return float(cv2.Laplacian(img, cv2.CV_64F).var())
+
+
+def detect_moire(path):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return False, 0.0
+
+    small = cv2.resize(img, (256, 256))
+    f = np.fft.fft2(small)
+    fshift = np.fft.fftshift(f)
+    magnitude = np.abs(fshift)
+
+    rows, cols = small.shape
+    crow, ccol = rows // 2, cols // 2
+    mask = np.ones((rows, cols), np.uint8)
+    r = 20
+    mask[crow-r:crow+r, ccol-r:ccol+r] = 0
+
+    peaks = magnitude * mask
+    peak_ratio = float(np.max(peaks) / (np.mean(magnitude) + 1e-6))
+    is_moire = peak_ratio > MOIRE_THRESHOLD
+    return is_moire, peak_ratio
+
+
+def temporal_consistency(paths):
+    diffs = []
+    for i in range(len(paths) - 1):
+        img1 = cv2.imread(paths[i], cv2.IMREAD_GRAYSCALE)
+        img2 = cv2.imread(paths[i + 1], cv2.IMREAD_GRAYSCALE)
+
+        if img1 is None or img2 is None:
+            continue
+
+        if img1.shape != img2.shape:
+            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+
+        diff = cv2.absdiff(img1, img2)
+        mean_diff = float(np.mean(diff))
+        diffs.append(mean_diff)
+
+    if len(diffs) < 2:
+        return False, {'reason': 'insufficient_frames', 'diffs': diffs}
+
+    median_diff = float(np.median(diffs))
+    max_diff = float(np.max(diffs))
+
+    if max_diff < TEMP_STATIC_MAX:
+        return False, {
+            'reason': 'completely_static',
+            'max_diff': max_diff,
+            'msg': 'No natural motion detected. Real person required.'
+        }
+
+    if max_diff > median_diff * TEMP_JUMP_RATIO and median_diff > 1.0:
+        return False, {
+            'reason': 'sudden_jump',
+            'max_diff': max_diff,
+            'median_diff': median_diff,
+            'msg': 'Abnormal frame switch detected (possible photo/video spoof).'
+        }
+
+    return True, {'max_diff': max_diff, 'median_diff': median_diff}
+
+
+def analyze_blink_sequence(states):
+    clean = [s for s in states if s in ('open', 'closed')]
+    if len(clean) < 3:
+        return False, 'Need at least 3 valid eye-state frames'
+
+    if 'closed' not in clean:
+        return False, 'No eye closure detected. Please blink naturally.'
+
+    natural_blink = False
+    for i in range(1, len(clean) - 1):
+        if clean[i] == 'closed' and clean[i - 1] == 'open' and clean[i + 1] == 'open':
+            natural_blink = True
+            break
+
+    if not natural_blink:
+        return False, 'Unnatural eye pattern. Blink your eyes normally (open-closed-open).'
+
+    transitions = sum(1 for i in range(len(clean) - 1) if clean[i] != clean[i + 1])
+    if transitions < 2:
+        return False, 'Eye movement insufficient'
+    if transitions > 5:
+        return False, 'Too many eye state changes (unnatural)'
+
+    return True, 'Natural blink verified'
+
+
+# ==================== ROUTES ====================
+
+@app.route('/')
+def index():
     return jsonify({
-        'success': True,
         'status': 'running',
-        'service': 'Face Recognition API (DeepFace)',
-        'version': '2.1.0',
+        'version': '4.0-strong',
+        'liveness': MEDIAPIPE_OK,
+        'endpoints': [
+            '/health',
+            '/face/register',
+            '/face/verify',
+            '/face/liveness-verify',
+            '/face/liveness-verify-strong',
+            '/face/check-eyes',
+            '/face/delete',
+            '/face/list',
+            '/face/auto-verify'
+        ]
     })
 
 
-@app.route('/health', methods=['GET'])
+@app.route('/health')
 def health():
     return jsonify({
         'success': True,
-        'message': 'server running',
-        'service': 'Face Recognition API',
-        'version': '2.1.0',
-        'time': datetime.now().isoformat(),
+        'liveness': MEDIAPIPE_OK,
+        'time': datetime.now().isoformat()
     })
 
 
-@app.route('/detect', methods=['POST'])
-def detect_face():
-    """Check if exactly one face exists in photo"""
-    temp_path = None
+@app.route('/face/register', methods=['POST'])
+def register():
     try:
-        data = request.json or {}
-        image_base64 = get_image_from_request(data)
+        d = request.json or {}
+        uid = (d.get('userId') or '').strip()
+        name = (d.get('name') or d.get('userName') or '').strip()
+        b64 = d.get('imageBase64') or d.get('image') or ''
 
-        if not image_base64:
-            return jsonify({
-                'success': False,
-                'faceDetected': False,
-                'faceCount': 0,
-                'message': 'No image provided'
-            }), 400
+        if not uid or not b64:
+            return jsonify({'success': False, 'msg': 'userId + imageBase64 required'}), 400
 
-        temp_path = build_temp_path('detect')
-        save_base64_image(image_base64, temp_path)
+        udir = os.path.join(FACES_DIR, uid)
+        os.makedirs(udir, exist_ok=True)
+        fpath = os.path.join(udir, 'face.jpg')
+        save_b64(b64, fpath)
 
-        face_count, faces = count_faces(temp_path)
+        faces = detect_faces(fpath)
+        if len(faces) == 0:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+            return jsonify({'success': False, 'msg': 'No face detected'}), 400
 
-        if face_count == 0:
-            return jsonify({
-                'success': False,
-                'faceDetected': False,
-                'faceCount': 0,
-                'message': 'No face detected'
-            })
+        if len(faces) > 1:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+            return jsonify({'success': False, 'msg': 'Multiple faces — only 1 allowed'}), 400
 
-        if face_count > 1:
-            return jsonify({
-                'success': False,
-                'faceDetected': True,
-                'faceCount': face_count,
-                'message': f'{face_count} faces detected. Sirf ek face chahiye.'
-            })
+        with open(os.path.join(udir, 'meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                'userId': uid,
+                'userName': name,
+                'at': datetime.now().isoformat()
+            }, f, indent=2)
 
-        face = faces[0]
         return jsonify({
             'success': True,
-            'faceDetected': True,
-            'faceCount': 1,
-            'confidence': round(float(face.get('confidence', 0)) * 100, 2),
-            'faceLocation': face.get('facial_area', {}),
-            'message': 'Face detected ✅'
+            'msg': f'{name or uid} registered OK',
+            'userId': uid
+        })
+    except Exception as e:
+        print(f"register error: {e}")
+        return jsonify({'success': False, 'msg': str(e)}), 500
+
+
+@app.route('/face/verify', methods=['POST'])
+def verify():
+    t = None
+    try:
+        d = request.json or {}
+        uid = (d.get('userId') or '').strip()
+        b64 = d.get('imageBase64') or d.get('image') or ''
+
+        if not uid or not b64:
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'msg': 'userId + image required'
+            }), 400
+
+        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+        if not os.path.exists(reg):
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'msg': 'Face not registered'
+            }), 404
+
+        t = tmp_path('v')
+        save_b64(b64, t)
+
+        faces = detect_faces(t)
+        if len(faces) == 0:
+            return jsonify({'success': False, 'matched': False, 'msg': 'No face detected'}), 400
+        if len(faces) > 1:
+            return jsonify({'success': False, 'matched': False, 'msg': 'Multiple faces'}), 400
+
+        matched, conf, dist, thresh = verify_match(reg, t)
+
+        return jsonify({
+            'success': True,
+            'matched': matched,
+            'confidence': conf,
+            'distance': dist,
+            'threshold': thresh,
+            'userName': get_username(uid),
+            'msg': f'Matched {conf}%' if matched else f'Not matched {conf}%'
+        })
+    except Exception as e:
+        print(f"verify error: {e}")
+        return jsonify({'success': False, 'matched': False, 'msg': str(e)}), 500
+    finally:
+        cleanup(t)
+
+
+@app.route('/face/check-eyes', methods=['POST'])
+def check_eyes():
+    t = None
+    try:
+        if not MEDIAPIPE_OK:
+            return jsonify({'success': False, 'msg': 'mediapipe not installed'}), 500
+
+        d = request.json or {}
+        b64 = d.get('imageBase64') or ''
+        if not b64:
+            return jsonify({'success': False, 'msg': 'image required'}), 400
+
+        t = tmp_path('eye')
+        save_b64(b64, t)
+        state, detail = eye_state(t)
+
+        return jsonify({
+            'success': state != 'error',
+            'eyeState': state,
+            'detail': detail
+        })
+    except Exception as e:
+        print(f"check_eyes error: {e}")
+        return jsonify({'success': False, 'msg': str(e)}), 500
+    finally:
+        cleanup(t)
+
+
+@app.route('/face/liveness-verify', methods=['POST'])
+def liveness_verify():
+    tc = None
+    to = None
+    try:
+        d = request.json or {}
+        uid = (d.get('userId') or '').strip()
+        b64_closed = d.get('frameClosedBase64') or d.get('frame1') or ''
+        b64_open = d.get('frameOpenBase64') or d.get('frame2') or ''
+
+        if not uid:
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': 'userId required'
+            }), 400
+
+        if not b64_closed or not b64_open:
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': 'Both frames required'
+            }), 400
+
+        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+        if not os.path.exists(reg):
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': 'Not registered'
+            }), 404
+
+        tc = tmp_path('lc')
+        to = tmp_path('lo')
+        save_b64(b64_closed, tc)
+        save_b64(b64_open, to)
+
+        live_ok = False
+        live_msg = ''
+
+        if MEDIAPIPE_OK:
+            s1, d1 = eye_state(tc)
+            s2, d2 = eye_state(to)
+
+            if s1 == 'error':
+                live_msg = f'Frame1 error: {d1}'
+            elif s2 == 'error':
+                live_msg = f'Frame2 error: {d2}'
+            elif s1 == 'closed' and s2 == 'open':
+                live_ok = True
+                live_msg = f'Blink OK (closed:{d1}, open:{d2})'
+            elif s1 == 'open' and s2 == 'open':
+                live_msg = 'Both frames eyes OPEN — blink not detected'
+            elif s1 == 'closed' and s2 == 'closed':
+                live_msg = 'Both frames eyes CLOSED — open eyes in frame 2'
+            else:
+                live_msg = f'Unexpected: frame1={s1}, frame2={s2}'
+        else:
+            live_ok = True
+            live_msg = 'mediapipe missing — skipped'
+
+        if not live_ok:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': False,
+                'msg': live_msg,
+                'step': 'liveness_failed'
+            })
+
+        faces = detect_faces(to)
+        if len(faces) == 0:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': True,
+                'msg': 'No face in frame 2'
+            })
+
+        matched, conf, dist, thresh = verify_match(reg, to)
+        msg = f'Live+Matched {conf}%' if matched else f'Live but NOT matched {conf}%'
+
+        return jsonify({
+            'success': True,
+            'matched': matched,
+            'live': True,
+            'confidence': conf,
+            'distance': dist,
+            'threshold': thresh,
+            'userName': get_username(uid),
+            'msg': msg,
+            'liveMsg': live_msg,
+            'time': datetime.now().isoformat()
         })
 
     except Exception as e:
+        print(f"liveness_verify error: {e}")
+        return jsonify({'success': False, 'matched': False, 'live': False, 'msg': str(e)}), 500
+    finally:
+        cleanup(tc, to)
+
+
+@app.route('/face/liveness-verify-strong', methods=['POST'])
+def liveness_verify_strong():
+    temp_paths = []
+    try:
+        d = request.json or {}
+        uid = (d.get('userId') or '').strip()
+        frames = d.get('framesBase64') or []
+
+        if not uid:
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': 'userId required',
+                'layer': 'input'
+            }), 400
+
+        if len(frames) < MIN_FRAMES:
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': f'Send {MIN_FRAMES}-{MAX_FRAMES} frames for strong verification',
+                'layer': 'input'
+            }), 400
+
+        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+        if not os.path.exists(reg):
+            return jsonify({
+                'success': False,
+                'matched': False,
+                'live': False,
+                'msg': 'Face not registered',
+                'layer': 'registration'
+            }), 404
+
+        for i, b64 in enumerate(frames[:MAX_FRAMES]):
+            p = tmp_path(f'str_{i}')
+            save_b64(b64, p)
+            temp_paths.append(p)
+
+        checks = {
+            'frames_ok': False,
+            'blink_natural': False,
+            'micro_movement': False,
+            'texture_real': False,
+            'no_moire': False,
+            'temporal_smooth': False,
+            'face_match': False
+        }
+
+        # LAYER 1: Single face per frame
+        face_data = []
+        for p in temp_paths:
+            fcs = detect_faces(p)
+            if len(fcs) != 1:
+                return jsonify({
+                    'success': False,
+                    'matched': False,
+                    'live': False,
+                    'msg': 'Multiple or no face in frame. Exactly 1 face required.',
+                    'layer': 'face_count',
+                    'checks': checks
+                }), 400
+            face_data.append({
+                'confidence': float(fcs[0].get('confidence', 0)),
+                'area': get_face_area(p)
+            })
+
+        checks['frames_ok'] = True
+
+        # LAYER 2: Natural Blink
+        eye_states = []
+        eye_details = []
+        for p in temp_paths:
+            if MEDIAPIPE_OK:
+                st, det = eye_state(p)
+            else:
+                st, det = 'unknown', 'mediapipe_off'
+            eye_states.append(st)
+            eye_details.append(det)
+
+        blink_ok, blink_msg = analyze_blink_sequence(eye_states)
+        if not blink_ok:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': False,
+                'msg': blink_msg,
+                'layer': 'blink',
+                'eye_sequence': eye_states,
+                'eye_details': eye_details,
+                'checks': checks
+            })
+        checks['blink_natural'] = True
+
+        # LAYER 3: Micro-movement
+        areas = [fd['area'] for fd in face_data if fd['area'] > 0]
+        if len(areas) >= 2:
+            area_variance = (max(areas) - min(areas)) / (max(areas) + 1e-6)
+            if area_variance < AREA_VAR_MIN:
+                return jsonify({
+                    'success': True,
+                    'matched': False,
+                    'live': False,
+                    'msg': 'Static image detected. Real person required (no micro-movement).',
+                    'layer': 'micro_movement',
+                    'area_variance': round(area_variance, 4),
+                    'checks': checks
+                })
+        checks['micro_movement'] = True
+
+        # LAYER 4: Texture / Depth
+        lap_vars = [laplacian_variance(p) for p in temp_paths]
+        avg_lap = float(np.mean(lap_vars))
+        if avg_lap < LAP_THRESHOLD:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': False,
+                'msg': 'Flat image detected (possible photo/screen). Real 3D face required.',
+                'layer': 'texture',
+                'laplacian_avg': round(avg_lap, 2),
+                'checks': checks
+            })
+        checks['texture_real'] = True
+
+        # LAYER 5: Screen / Moire
+        for i, p in enumerate(temp_paths):
+            is_moire, ratio = detect_moire(p)
+            if is_moire:
+                return jsonify({
+                    'success': True,
+                    'matched': False,
+                    'live': False,
+                    'msg': 'Screen/photo spoof detected (moire pattern). Real person required.',
+                    'layer': 'moire',
+                    'frame_index': i,
+                    'moire_ratio': round(ratio, 2),
+                    'checks': checks
+                })
+        checks['no_moire'] = True
+
+        # LAYER 6: Temporal consistency
+        smooth, temp_info = temporal_consistency(temp_paths)
+        if not smooth:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': False,
+                'msg': temp_info.get('msg', 'Unnatural frame sequence.'),
+                'layer': 'temporal',
+                'details': temp_info,
+                'checks': checks
+            })
+        checks['temporal_smooth'] = True
+
+        # LAYER 7: Face Match
+        best_idx = 0
+        best_score = -1
+        for i in range(len(temp_paths)):
+            conf_score = face_data[i]['confidence']
+            eye_ok = eye_states[i] == 'open'
+            score = conf_score + (100 if eye_ok else 0)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        matched, conf, dist, thresh = verify_match(reg, temp_paths[best_idx])
+        checks['face_match'] = matched
+
+        if not matched:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': True,
+                'msg': f'Live person verified, but face NOT matched ({conf}%). Register again if needed.',
+                'layer': 'face_match',
+                'confidence': conf,
+                'checks': checks,
+                'time': datetime.now().isoformat()
+            })
+
+        return jsonify({
+            'success': True,
+            'matched': True,
+            'live': True,
+            'confidence': conf,
+            'distance': dist,
+            'threshold': thresh,
+            'userName': get_username(uid),
+            'msg': f'✅ Strong Liveness Passed + Matched ({conf}%)',
+            'checks': checks,
+            'eye_sequence': eye_states,
+            'eye_details': eye_details,
+            'time': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        print(f"liveness_verify_strong error: {e}")
         return jsonify({
             'success': False,
-            'message': f'Error: {str(e)}'
+            'matched': False,
+            'live': False,
+            'msg': f'Server error: {str(e)}',
+            'layer': 'exception'
         }), 500
     finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        cleanup(*temp_paths)
 
 
-@app.route('/register', methods=['POST'])
-@app.route('/face/register', methods=['POST'])
-def register_face():
-    """Register employee/manager face"""
+@app.route('/face/auto-verify', methods=['POST'])
+def auto_verify():
+    temp_paths = []
     try:
-        data = request.json or {}
-        user_id = data.get('userId', '').strip()
-        user_name = get_name_from_request(data).strip()
-        image_base64 = get_image_from_request(data)
+        d = request.json or {}
+        uid = (d.get('userId') or '').strip()
+        frames = d.get('framesBase64') or []
 
-        if not user_id or not image_base64:
+        if not uid:
             return jsonify({
                 'success': False,
-                'message': 'userId and image required'
+                'matched': False,
+                'live': False,
+                'msg': 'userId required'
             }), 400
 
-        user_dir = os.path.join(FACES_DIR, user_id)
-        os.makedirs(user_dir, exist_ok=True)
-
-        face_path = os.path.join(user_dir, 'face.jpg')
-        save_base64_image(image_base64, face_path)
-
-        face_count, _ = count_faces(face_path)
-
-        if face_count == 0:
-            if os.path.exists(face_path):
-                os.remove(face_path)
-            return jsonify({
-                'success': False,
-                'message': 'No face detected in photo'
-            })
-
-        if face_count > 1:
-            if os.path.exists(face_path):
-                os.remove(face_path)
-            return jsonify({
-                'success': False,
-                'message': 'Multiple faces detected. Sirf ek face hona chahiye.'
-            })
-
-        meta_path = os.path.join(user_dir, 'meta.json')
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'userId': user_id,
-                'userName': user_name,
-                'registeredAt': datetime.now().isoformat(),
-            }, f, ensure_ascii=False, indent=2)
-
-        return jsonify({
-            'success': True,
-            'message': f'{user_name or user_id} ka face register ho gaya ✅',
-            'userId': user_id,
-        })
-
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error: {str(e)}'
-        }), 500
-
-
-@app.route('/verify', methods=['POST'])
-@app.route('/face/verify', methods=['POST'])
-def verify_face():
-    """Verify face for attendance"""
-    temp_path = None
-    try:
-        data = request.json or {}
-        user_id = data.get('userId', '').strip()
-        image_base64 = get_image_from_request(data)
-
-        if not user_id or not image_base64:
+        if len(frames) < 3:
             return jsonify({
                 'success': False,
                 'matched': False,
-                'message': 'userId and image required'
+                'live': False,
+                'msg': 'Need 3 frames'
             }), 400
 
-        registered_path = os.path.join(FACES_DIR, user_id, 'face.jpg')
-        if not os.path.exists(registered_path):
+        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
+        if not os.path.exists(reg):
             return jsonify({
                 'success': False,
                 'matched': False,
-                'message': 'Face not registered'
-            })
+                'live': False,
+                'msg': 'Face not registered'
+            }), 400
 
-        temp_path = build_temp_path(f'verify_{user_id}')
-        save_base64_image(image_base64, temp_path)
+        for i, b64 in enumerate(frames[:3]):
+            p = tmp_path(f'auto_{i}')
+            save_b64(b64, p)
+            temp_paths.append(p)
 
-        face_count, _ = count_faces(temp_path)
+        face_boxes = []
+        for i, p in enumerate(temp_paths):
+            try:
+                faces = DeepFace.extract_faces(
+                    img_path=p,
+                    detector_backend=BACKEND,
+                    enforce_detection=False
+                )
+                valid = [f for f in faces if float(f.get('confidence', 0)) > 0.5]
+                if len(valid) != 1:
+                    return jsonify({
+                        'success': False,
+                        'matched': False,
+                        'live': False,
+                        'msg': f'Frame {i+1}: {len(valid)} faces found. Exactly 1 face needed.'
+                    }), 400
 
-        if face_count == 0:
+                fa = valid[0].get('facial_area', {})
+                face_boxes.append({
+                    'x': fa.get('x', 0),
+                    'y': fa.get('y', 0),
+                    'w': fa.get('w', 0),
+                    'h': fa.get('h', 0)
+                })
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'matched': False,
+                    'live': False,
+                    'msg': f'Frame {i+1} face detect error: {str(e)}'
+                }), 500
+
+        movements = []
+        for i in range(len(face_boxes) - 1):
+            dx = abs(face_boxes[i]['x'] - face_boxes[i + 1]['x'])
+            dy = abs(face_boxes[i]['y'] - face_boxes[i + 1]['y'])
+            dw = abs(face_boxes[i]['w'] - face_boxes[i + 1]['w'])
+            dh = abs(face_boxes[i]['h'] - face_boxes[i + 1]['h'])
+            movements.append(dx + dy + dw + dh)
+
+        avg_movement = sum(movements) / len(movements) if movements else 0
+        print(f"Auto-verify: avg_movement={avg_movement}")
+
+        if avg_movement < 1.0:
             return jsonify({
-                'success': False,
+                'success': True,
                 'matched': False,
-                'message': 'No face detected in live photo'
-            })
+                'live': False,
+                'msg': 'Static image detected. Please hold phone naturally and do not use photos.'
+            }), 200
 
-        if face_count > 1:
+        lap_scores = [laplacian_variance(p) for p in temp_paths]
+        avg_lap = sum(lap_scores) / len(lap_scores)
+        print(f"Auto-verify: avg_lap={avg_lap}")
+
+        if avg_lap < 30.0:
             return jsonify({
-                'success': False,
+                'success': True,
                 'matched': False,
-                'message': 'Multiple faces detected in live photo'
-            })
+                'live': False,
+                'msg': 'Flat image detected. Real person required.'
+            }), 200
 
+        best_frame = temp_paths[1] if len(temp_paths) >= 2 else temp_paths[0]
         result = DeepFace.verify(
-            img1_path=registered_path,
-            img2_path=temp_path,
-            model_name=MODEL_NAME,
-            detector_backend=DETECTOR_BACKEND,
-            enforce_detection=True,
+            img1_path=reg,
+            img2_path=best_frame,
+            model_name=MODEL,
+            detector_backend=BACKEND,
+            enforce_detection=False,
         )
 
         matched = bool(result.get('verified', False))
         distance = float(result.get('distance', 0))
         threshold = float(result.get('threshold', 1))
+        confidence = max(0, min(100, (1 - distance / threshold) * 100)) if threshold > 0 else 0
 
-        if threshold > 0:
-            confidence = max(0, min(100, (1 - (distance / threshold)) * 100))
-        else:
-            confidence = 0
-
-        meta_path = os.path.join(FACES_DIR, user_id, 'meta.json')
-        user_name = ''
-        if os.path.exists(meta_path):
-            with open(meta_path, 'r', encoding='utf-8') as f:
-                meta = json.load(f)
-                user_name = meta.get('userName', '')
+        if not matched:
+            return jsonify({
+                'success': True,
+                'matched': False,
+                'live': True,
+                'confidence': round(confidence, 2),
+                'msg': f'Face NOT matched ❌ ({round(confidence,1)}%). Please contact admin to re-register your face.'
+            }), 200
 
         return jsonify({
             'success': True,
-            'matched': matched,
+            'matched': True,
+            'live': True,
             'confidence': round(confidence, 2),
-            'distance': round(distance, 4),
-            'threshold': round(threshold, 4),
-            'userName': user_name,
-            'message': f'Face matched ✅ ({round(confidence, 2)}%)' if matched else f'Face NOT matched ❌ ({round(confidence, 2)}%)',
-            'timestamp': datetime.now().isoformat(),
+            'userName': get_username(uid),
+            'msg': f'✅ Verified + Matched ({round(confidence,1)}%)',
+            'time': datetime.now().isoformat()
         })
 
     except Exception as e:
+        print(f"AUTO_VERIFY CRASH: {str(e)}")
         return jsonify({
             'success': False,
             'matched': False,
-            'message': f'Error: {str(e)}'
+            'live': False,
+            'msg': f'Server error: {str(e)}'
         }), 500
     finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        cleanup(*temp_paths)
 
 
-@app.route('/delete', methods=['POST'])
 @app.route('/face/delete', methods=['POST'])
-def delete_face():
-    """Delete registered face"""
+def delete():
     try:
-        data = request.json or {}
-        user_id = data.get('userId', '').strip()
-        user_dir = os.path.join(FACES_DIR, user_id)
-
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir)
-            return jsonify({
-                'success': True,
-                'message': 'Face deleted'
-            })
-
-        return jsonify({
-            'success': False,
-            'message': 'User not found'
-        })
-
+        uid = (request.json or {}).get('userId', '').strip()
+        d = os.path.join(FACES_DIR, uid)
+        if os.path.exists(d):
+            shutil.rmtree(d)
+            return jsonify({'success': True, 'msg': 'Deleted'})
+        return jsonify({'success': False, 'msg': 'Not found'}), 404
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error: {str(e)}'
-        }), 500
+        print(f"delete error: {e}")
+        return jsonify({'success': False, 'msg': str(e)}), 500
 
 
-@app.route('/list', methods=['GET'])
-def list_users():
-    """List registered users"""
-    users = []
-    if os.path.exists(FACES_DIR):
-      for uid in os.listdir(FACES_DIR):
-          meta_path = os.path.join(FACES_DIR, uid, 'meta.json')
-          if os.path.exists(meta_path):
-              with open(meta_path, 'r', encoding='utf-8') as f:
-                  meta = json.load(f)
-                  users.append(meta)
-
-    return jsonify({
-        'success': True,
-        'users': users,
-        'count': len(users)
-    })
+@app.route('/face/list')
+def list_faces():
+    try:
+        users = []
+        if os.path.exists(FACES_DIR):
+            for uid in os.listdir(FACES_DIR):
+                m = os.path.join(FACES_DIR, uid, 'meta.json')
+                if os.path.exists(m):
+                    with open(m, 'r', encoding='utf-8') as f:
+                        users.append(json.load(f))
+        return jsonify({'success': True, 'count': len(users), 'users': users})
+    except Exception as e:
+        print(f"list_faces error: {e}")
+        return jsonify({'success': False, 'msg': str(e)}), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_DEBUG', '1') == '1'
-    print(f"🚀 Face API running on http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    print("=" * 60)
+    print(" FACE + STRONG LIVENESS SERVER v4.0 ")
+    print(f" Port: {port}")
+    print(f" Liveness: {'ON' if MEDIAPIPE_OK else 'OFF'}")
+    print(f" Faces dir: {os.path.abspath(FACES_DIR)}")
+    print("=" * 60)
+    app.run(host='0.0.0.0', port=port, debug=False)
