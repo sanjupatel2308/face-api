@@ -53,8 +53,6 @@ LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 
 
-# ==================== HELPERS ====================
-
 def decode_b64(b64):
     if ',' in b64:
         b64 = b64.split(',')[1]
@@ -105,7 +103,6 @@ def eye_state(path):
         img = cv2.imread(path)
         if img is None:
             return 'error', 'cannot read image'
-        
         h, w = img.shape[:2]
         if h < 50 or w < 50:
             return 'error', f'image too small: {w}x{h}'
@@ -178,8 +175,7 @@ def temporal_consistency(paths):
     for i in range(len(paths) - 1):
         img1 = cv2.imread(paths[i], cv2.IMREAD_GRAYSCALE)
         img2 = cv2.imread(paths[i+1], cv2.IMREAD_GRAYSCALE)
-        if img1 is None or img2 is None:
-            continue
+        if img1 is None or img2 is None: continue
         if img1.shape != img2.shape:
             img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
         diff = cv2.absdiff(img1, img2)
@@ -205,7 +201,6 @@ def analyze_blink_sequence(states):
     clean = [s for s in states if s in ('open', 'closed')]
     if len(clean) < 3:
         return False, 'Need at least 3 valid eye-state frames'
-    
     if 'closed' not in clean:
         return False, 'No eye closure detected. Please blink naturally.'
     
@@ -214,7 +209,6 @@ def analyze_blink_sequence(states):
         if clean[i] == 'closed' and clean[i-1] == 'open' and clean[i+1] == 'open':
             natural_blink = True
             break
-    
     if not natural_blink:
         return False, 'Unnatural eye pattern. Blink normally (open-closed-open).'
     
@@ -231,22 +225,12 @@ def analyze_blink_sequence(states):
 
 @app.route('/')
 def index():
-    return jsonify({
-        'status': 'running',
-        'version': '4.2-stable',
-        'liveness': MEDIAPIPE_OK,
-        'message': 'Server is live'
-    })
+    return jsonify({'status': 'running', 'version': '4.3-final', 'liveness': MEDIAPIPE_OK})
 
 
 @app.route('/health')
 def health():
-    return jsonify({
-        'success': True,
-        'liveness': MEDIAPIPE_OK,
-        'time': datetime.now().isoformat(),
-        'status': 'healthy'
-    })
+    return jsonify({'success': True, 'liveness': MEDIAPIPE_OK, 'status': 'healthy'})
 
 
 @app.route('/face/register', methods=['POST'])
@@ -254,11 +238,11 @@ def register():
     try:
         d = request.json or {}
         uid = (d.get('userId') or '').strip()
-        name = (d.get('name') or d.get('userName') or '').strip()
-        b64 = d.get('imageBase64') or d.get('image') or ''
+        name = (d.get('name') or '').strip()
+        b64 = d.get('imageBase64') or ''
 
         if not uid or not b64:
-            return jsonify({'success': False, 'msg': 'userId + imageBase64 required'}), 400
+            return jsonify({'success': False, 'msg': 'userId and imageBase64 required'}), 400
 
         udir = os.path.join(FACES_DIR, uid)
         os.makedirs(udir, exist_ok=True)
@@ -271,22 +255,14 @@ def register():
             return jsonify({'success': False, 'msg': 'No face detected'}), 400
         if len(faces) > 1:
             if os.path.exists(fpath): os.remove(fpath)
-            return jsonify({'success': False, 'msg': 'Multiple faces — only 1 allowed'}), 400
+            return jsonify({'success': False, 'msg': 'Multiple faces not allowed'}), 400
 
         with open(os.path.join(udir, 'meta.json'), 'w', encoding='utf-8') as f:
-            json.dump({
-                'userId': uid,
-                'userName': name,
-                'at': datetime.now().isoformat()
-            }, f, indent=2)
+            json.dump({'userId': uid, 'userName': name, 'registered_at': datetime.now().isoformat()}, f, indent=2)
 
-        return jsonify({
-            'success': True,
-            'msg': f'{name or uid} registered successfully',
-            'userId': uid
-        })
+        return jsonify({'success': True, 'msg': 'Face registered successfully', 'userId': uid})
     except Exception as e:
-        print(f"Register Error: {e}")
+        print(f"REGISTER ERROR: {e}")
         return jsonify({'success': False, 'msg': str(e)}), 500
 
 
@@ -301,10 +277,10 @@ def auto_verify():
         if not uid:
             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'userId required'}), 400
         if len(frames) < 3:
-            return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Need at least 3 frames'}), 400
+            return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Minimum 3 frames required'}), 400
 
-        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
-        if not os.path.exists(reg):
+        reg_path = os.path.join(FACES_DIR, uid, 'face.jpg')
+        if not os.path.exists(reg_path):
             return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'Face not registered'}), 400
 
         for i, b64 in enumerate(frames[:3]):
@@ -312,217 +288,57 @@ def auto_verify():
             save_b64(b64, p)
             temp_paths.append(p)
 
+        # Check each frame has exactly 1 face
         for i, p in enumerate(temp_paths):
-            faces = detect_faces(p)
-            if len(faces) != 1:
+            if len(detect_faces(p)) != 1:
                 cleanup(*temp_paths)
-                return jsonify({'success': False, 'matched': False, 'live': False, 
-                              'msg': f'Frame {i+1}: Exactly 1 face required'}), 400
+                return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Frame {i+1}: Exactly 1 face required'}), 400
 
+        # Texture Check
         lap_scores = [laplacian_variance(p) for p in temp_paths]
         avg_lap = sum(lap_scores) / len(lap_scores)
         if avg_lap < 30.0:
             cleanup(*temp_paths)
-            return jsonify({'success': True, 'matched': False, 'live': False, 
-                          'msg': 'Flat image detected. Real person required.'}), 200
+            return jsonify({'success': True, 'matched': False, 'live': False, 'msg': 'Flat image detected. Real person required.'}), 200
 
+        # Face Match
         best_frame = temp_paths[1] if len(temp_paths) >= 2 else temp_paths[0]
-        matched, conf, dist, thresh = verify_match(reg, best_frame)
+        matched, conf, dist, thresh = verify_match(reg_path, best_frame)
+
+        cleanup(*temp_paths)
 
         if not matched:
-            cleanup(*temp_paths)
             return jsonify({
                 'success': True,
                 'matched': False,
                 'live': True,
                 'confidence': round(conf, 2),
-                'msg': f'Face NOT matched ({round(conf,1)}%). Please re-register your face.'
+                'msg': f'Face NOT matched ({round(conf,1)}%). Please re-register.'
             }), 200
 
-        cleanup(*temp_paths)
         return jsonify({
             'success': True,
             'matched': True,
             'live': True,
             'confidence': round(conf, 2),
             'userName': get_username(uid),
-            'msg': f'✅ Verified + Matched ({round(conf,1)}%)',
-            'time': datetime.now().isoformat()
+            'msg': f'✅ Verified + Matched ({round(conf,1)}%)'
         })
 
     except Exception as e:
-        print(f"AUTO_VERIFY CRASH: {str(e)}")
-        return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Server error: {str(e)}'}), 500
-    finally:
+        print(f"AUTO_VERIFY ERROR: {e}")
         cleanup(*temp_paths)
-
-
-@app.route('/face/liveness-verify-strong', methods=['POST'])
-def liveness_verify_strong():
-    temp_paths = []
-    try:
-        d = request.json or {}
-        uid = (d.get('userId') or '').strip()
-        frames = d.get('framesBase64') or []
-
-        if not uid:
-            return jsonify({'success': False, 'matched': False, 'live': False, 'msg': 'userId required', 'layer': 'input'}), 400
-
-        if len(frames) < MIN_FRAMES:
-            return jsonify({'success': False, 'matched': False, 'live': False, 
-                          'msg': f'Send {MIN_FRAMES}-{MAX_FRAMES} frames', 'layer': 'input'}), 400
-
-        reg = os.path.join(FACES_DIR, uid, 'face.jpg')
-        if not os.path.exists(reg):
-            return jsonify({'success': False, 'matched': False, 'live': False, 
-                          'msg': 'Face not registered', 'layer': 'registration'}), 400
-
-        for i, b64 in enumerate(frames[:MAX_FRAMES]):
-            p = tmp_path(f'str_{i}')
-            save_b64(b64, p)
-            temp_paths.append(p)
-
-        checks = {
-            'frames_ok': False, 'blink_natural': False, 'micro_movement': False,
-            'texture_real': False, 'temporal_smooth': False, 'face_match': False
-        }
-
-        face_data = []
-        for p in temp_paths:
-            fcs = detect_faces(p)
-            if len(fcs) != 1:
-                cleanup(*temp_paths)
-                return jsonify({'success': False, 'matched': False, 'live': False,
-                              'msg': 'Exactly 1 face required in each frame', 'layer': 'face_count',
-                              'checks': checks}), 400
-            face_data.append({'confidence': float(fcs[0].get('confidence', 0)), 'area': get_face_area(p)})
-        checks['frames_ok'] = True
-
-        # Blink Analysis
-        eye_states = []
-        for p in temp_paths:
-            if MEDIAPIPE_OK:
-                st, _ = eye_state(p)
-            else:
-                st = 'unknown'
-            eye_states.append(st)
-
-        blink_ok, blink_msg = analyze_blink_sequence(eye_states)
-        if not blink_ok:
-            cleanup(*temp_paths)
-            return jsonify({
-                'success': True, 'matched': False, 'live': False,
-                'msg': blink_msg, 'layer': 'blink', 'eye_sequence': eye_states,
-                'checks': checks
-            })
-
-        checks['blink_natural'] = True
-
-        # Micro Movement + Texture + Temporal
-        areas = [fd['area'] for fd in face_data if fd['area'] > 0]
-        if len(areas) >= 2:
-            area_variance = (max(areas) - min(areas)) / (max(areas) + 1e-6)
-            if area_variance < AREA_VAR_MIN:
-                cleanup(*temp_paths)
-                return jsonify({'success': True, 'matched': False, 'live': False,
-                              'msg': 'Static image detected.', 'layer': 'micro_movement', 'checks': checks})
-        checks['micro_movement'] = True
-
-        lap_vars = [laplacian_variance(p) for p in temp_paths]
-        avg_lap = float(np.mean(lap_vars))
-        if avg_lap < LAP_THRESHOLD:
-            cleanup(*temp_paths)
-            return jsonify({'success': True, 'matched': False, 'live': False,
-                          'msg': 'Flat image detected. Real person required.', 'layer': 'texture', 'checks': checks})
-        checks['texture_real'] = True
-
-        smooth, temp_info = temporal_consistency(temp_paths)
-        if not smooth:
-            cleanup(*temp_paths)
-            return jsonify({'success': True, 'matched': False, 'live': False,
-                          'msg': temp_info.get('msg', 'Unnatural movement'), 'layer': 'temporal', 'checks': checks})
-        checks['temporal_smooth'] = True
-
-        # Final Face Match
-        best_idx = 0
-        best_score = -1
-        for i in range(len(temp_paths)):
-            score = face_data[i]['confidence'] + (100 if eye_states[i] == 'open' else 0)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-        matched, conf, dist, thresh = verify_match(reg, temp_paths[best_idx])
-        checks['face_match'] = matched
-
-        if not matched:
-            cleanup(*temp_paths)
-            return jsonify({
-                'success': True, 'matched': False, 'live': True,
-                'msg': f'Live but face NOT matched ({conf}%)', 'confidence': conf,
-                'layer': 'face_match', 'checks': checks
-            })
-
-        cleanup(*temp_paths)
-        return jsonify({
-            'success': True,
-            'matched': True,
-            'live': True,
-            'confidence': conf,
-            'userName': get_username(uid),
-            'msg': f'✅ Strong Liveness + Face Matched ({conf}%)',
-            'checks': checks,
-            'eye_sequence': eye_states,
-            'time': datetime.now().isoformat()
-        })
-
-    except Exception as e:
-        print(f"LIVENESS_STRONG ERROR: {str(e)}")
-        return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Server error: {str(e)}'}), 500
-    finally:
-        cleanup(*temp_paths)
-
-
-@app.route('/face/delete', methods=['POST'])
-def delete():
-    try:
-        uid = (request.json or {}).get('userId', '').strip()
-        d = os.path.join(FACES_DIR, uid)
-        if os.path.exists(d):
-            shutil.rmtree(d)
-            return jsonify({'success': True, 'msg': 'Face deleted successfully'})
-        return jsonify({'success': False, 'msg': 'Face not found'}), 404
-    except Exception as e:
-        return jsonify({'success': False, 'msg': str(e)}), 500
-
-
-@app.route('/face/list')
-def list_faces():
-    try:
-        users = []
-        if os.path.exists(FACES_DIR):
-            for uid in os.listdir(FACES_DIR):
-                m = os.path.join(FACES_DIR, uid, 'meta.json')
-                if os.path.exists(m):
-                    with open(m, 'r', encoding='utf-8') as f:
-                        users.append(json.load(f))
-        return jsonify({'success': True, 'count': len(users), 'users': users})
-    except Exception as e:
-        return jsonify({'success': False, 'msg': str(e)}), 500
+        return jsonify({'success': False, 'matched': False, 'live': False, 'msg': str(e)}), 500
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print("=" * 75)
-    print("   FACE + STRONG LIVENESS SERVER v4.2 (Stable & Fixed)")
+    print("=" * 70)
+    print("   FACE RECOGNITION SERVER v4.3 (Final Stable)")
+    print(f"   MediaPipe: {'ENABLED' if MEDIAPIPE_OK else 'DISABLED'}")
     print(f"   Port: {port}")
-    print(f"   MediaPipe Liveness: {'ENABLED' if MEDIAPIPE_OK else 'DISABLED'}")
-    print(f"   Faces Directory: {os.path.abspath(FACES_DIR)}")
-    print("=" * 75)
+    print("=" * 70)
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-
 
 
 
