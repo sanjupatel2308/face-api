@@ -10,43 +10,60 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
 import gc
-from datetime import datetime
 import json
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
-# ===================== LIGHTWEIGHT CONFIG =====================
-MODEL = 'SFace'                    # Lightweight & Fast
+# ===================== CONFIG =====================
+MODEL = 'SFace'
 BACKEND = 'opencv'
 TMP_DIR = 'temp_files'
 MAX_IMAGE_SIZE = 512
 LAP_THRESHOLD = 35.0
-MIN_FRAMES = 3                     # ← Changed to 3 (frontend ke hisaab se)
+MIN_FRAMES = 3
 
 os.makedirs(TMP_DIR, exist_ok=True)
 
 FIRESTORE_COLLECTION = "users"
 
-# ===================== FIREBASE =====================
-if not firebase_admin._apps:
-    service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if service_account_json:
+print("="*80)
+print("SERVER STARTING - v5.6 DEBUG MODE")
+print("="*80)
+
+# ===================== FIREBASE (ROBUST INITIALIZATION) =====================
+db = None
+firebase_status = "NOT_INITIALIZED"
+
+service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+if service_account_json:
+    print("✅ FIREBASE_SERVICE_ACCOUNT_JSON environment variable FOUND")
+    try:
         cred_dict = json.loads(service_account_json)
         if "private_key" in cred_dict:
             cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+        
         cred = credentials.Certificate(cred_dict)
-        print("✅ Firebase Connected using ENV Variable")
-    else:
-        print("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not found!")
-        cred = None
-
-    if cred:
         firebase_admin.initialize_app(cred)
         db = firestore.client()
-    else:
-        db = None
+        firebase_status = "SUCCESSFULLY_INITIALIZED"
+        print("✅ Firebase Successfully Initialized")
+    except json.JSONDecodeError:
+        print("❌ JSON Parse Error: FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON")
+        firebase_status = "JSON_PARSE_ERROR"
+    except Exception as e:
+        print(f"❌ Firebase Initialization Failed: {e}")
+        firebase_status = f"ERROR: {e}"
+else:
+    print("❌ FIREBASE_SERVICE_ACCOUNT_JSON environment variable NOT FOUND!")
+    firebase_status = "ENV_VARIABLE_MISSING"
+
+print(f"Firebase Status: {firebase_status}")
+print("="*80)
+
 
 # ===================== HELPERS =====================
 def tmp_path(prefix='t'):
@@ -83,9 +100,7 @@ def laplacian_variance(path):
 
 def detect_faces(path):
     try:
-        faces = DeepFace.extract_faces(
-            img_path=path, detector_backend=BACKEND, enforce_detection=False
-        )
+        faces = DeepFace.extract_faces(img_path=path, detector_backend=BACKEND, enforce_detection=False)
         return [f for f in faces if float(f.get('confidence', 0)) > 0.5]
     except:
         return []
@@ -94,11 +109,8 @@ def detect_faces(path):
 def verify_match(reg_path, live_path):
     try:
         result = DeepFace.verify(
-            img1_path=reg_path,
-            img2_path=live_path,
-            model_name=MODEL,
-            detector_backend=BACKEND,
-            enforce_detection=False
+            img1_path=reg_path, img2_path=live_path,
+            model_name=MODEL, detector_backend=BACKEND, enforce_detection=False
         )
         matched = bool(result.get('verified', False))
         dist = float(result.get('distance', 0))
@@ -111,21 +123,20 @@ def verify_match(reg_path, live_path):
 
 def get_registered_face_info(uid):
     if db is None:
-        return None, "Firebase not initialized"
+        return None, f"Firebase not initialized ({firebase_status})"
     try:
         doc = db.collection(FIRESTORE_COLLECTION).document(uid).get()
         if not doc.exists:
-            return None, "User not found in Firebase"
+            return None, "User document not found"
 
         data = doc.to_dict() or {}
-        for field in ["photoURL", "photoUrl", "faceURL", "faceImageUrl", "cloudinaryUrl"]:
+        for field in ["photoURL", "photoUrl", "faceURL", "faceImageUrl", "cloudinaryUrl", "imageUrl"]:
             url = data.get(field)
             if url and isinstance(url, str) and url.startswith("http"):
                 return url, data.get("name") or data.get("userName") or "User"
-        return None, "photoURL field not found"
+        return None, "photoURL field not found in document"
     except Exception as e:
-        print(f"[Firebase Error] {e}")
-        return None, str(e)
+        return None, f"Firebase error: {str(e)}"
 
 
 def download_cloudinary(url):
@@ -149,7 +160,7 @@ def auto_verify():
         uid = (d.get('userId') or '').strip()
         frames = d.get('framesBase64') or []
 
-        print(f"[AUTO-VERIFY] UID: {uid} | Frames Received: {len(frames)}")
+        print(f"[AUTO-VERIFY] UID: {uid} | Frames: {len(frames)} | Firebase Status: {firebase_status}")
 
         if not uid:
             return jsonify({'success': False, 'msg': 'userId required'}), 400
@@ -158,7 +169,7 @@ def auto_verify():
 
         face_url, user_name = get_registered_face_info(uid)
         if not face_url:
-            return jsonify({'success': False, 'msg': f'Face not registered: {user_name}'}), 400
+            return jsonify({'success': False, 'matched': False, 'live': False, 'msg': f'Face not registered: {user_name}'}), 400
 
         reg_path = download_cloudinary(face_url)
         temp_paths.append(reg_path)
@@ -173,7 +184,6 @@ def auto_verify():
 
         lap_scores = [laplacian_variance(p) for p in live_paths]
         avg_lap = sum(lap_scores) / len(lap_scores)
-        print(f"[LIVENESS] Avg Laplacian: {avg_lap:.2f}")
 
         if avg_lap < LAP_THRESHOLD:
             return jsonify({
@@ -201,7 +211,7 @@ def auto_verify():
                 'matched': False,
                 'live': True,
                 'confidence': confidence,
-                'msg': f'Face match nahi hua ({confidence}%). Better lighting aur face position try karein.'
+                'msg': f'Face match nahi hua ({confidence}%). Better lighting try karein.'
             })
 
     except Exception as e:
@@ -211,31 +221,32 @@ def auto_verify():
         cleanup(*temp_paths)
 
 
-@app.route('/')
-def index():
-    return jsonify({'status': 'running', 'version': '5.5-memory-optimized', 'min_frames': MIN_FRAMES})
-
-
-@app.route('/health')
-def health():
-    return jsonify({'success': True, 'version': '5.5', 'status': 'healthy'})
-
-
 @app.route('/face/debug/<uid>')
 def debug_user(uid):
     face_url, info = get_registered_face_info(uid.strip())
     return jsonify({
         "success": True,
         "uid": uid,
+        "firebase_status": firebase_status,
         "face_url_found": bool(face_url),
         "info": info
     })
 
 
+@app.route('/')
+def index():
+    return jsonify({
+        'status': 'running',
+        'version': '5.6-debug',
+        'firebase': firebase_status,
+        'min_frames': MIN_FRAMES
+    })
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print("=" * 80)
-    print("🚀 MEMORY OPTIMIZED SERVER v5.5 (SFace + 512MB Friendly)")
-    print(f"   Minimum Frames: {MIN_FRAMES}")
-    print("=" * 80)
+    print("="*80)
+    print("FINAL DEBUG VERSION v5.6")
+    print(f"Firebase Status: {firebase_status}")
+    print("="*80)
     app.run(host='0.0.0.0', port=port, debug=False)
