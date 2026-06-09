@@ -17,35 +17,29 @@ app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
 
-# ===================== CONFIG =====================
-MODEL = 'SFace'                    # Lightweight model (better for Render)
+# ===================== LIGHTWEIGHT CONFIG =====================
+MODEL = 'SFace'                    # Lightweight & Fast
 BACKEND = 'opencv'
 TMP_DIR = 'temp_files'
 MAX_IMAGE_SIZE = 512
-LAP_THRESHOLD = 38.0
-MIN_FRAMES = 4
+LAP_THRESHOLD = 35.0
+MIN_FRAMES = 3                     # ← Changed to 3 (frontend ke hisaab se)
 
 os.makedirs(TMP_DIR, exist_ok=True)
 
 FIRESTORE_COLLECTION = "users"
-FACE_FIELD = "photoURL"
 
-# ===================== FIREBASE (Fixed) =====================
+# ===================== FIREBASE =====================
 if not firebase_admin._apps:
     service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-
     if service_account_json:
-        try:
-            cred_dict = json.loads(service_account_json)
-            if "private_key" in cred_dict:
-                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-            cred = credentials.Certificate(cred_dict)
-            print("✅ Firebase Connected using Environment Variable")
-        except Exception as e:
-            print(f"❌ Firebase JSON Parse Error: {e}")
-            cred = None
+        cred_dict = json.loads(service_account_json)
+        if "private_key" in cred_dict:
+            cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+        cred = credentials.Certificate(cred_dict)
+        print("✅ Firebase Connected using ENV Variable")
     else:
-        print("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not found in environment variables!")
+        print("⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not found!")
         cred = None
 
     if cred:
@@ -53,7 +47,6 @@ if not firebase_admin._apps:
         db = firestore.client()
     else:
         db = None
-        print("❌ Firebase initialization failed!")
 
 # ===================== HELPERS =====================
 def tmp_path(prefix='t'):
@@ -122,33 +115,29 @@ def get_registered_face_info(uid):
     try:
         doc = db.collection(FIRESTORE_COLLECTION).document(uid).get()
         if not doc.exists:
-            return None, "User document not found"
+            return None, "User not found in Firebase"
 
         data = doc.to_dict() or {}
-        for field in ["photoURL", "photoUrl", "faceURL", "faceImageUrl", "cloudinaryUrl", "imageUrl"]:
+        for field in ["photoURL", "photoUrl", "faceURL", "faceImageUrl", "cloudinaryUrl"]:
             url = data.get(field)
             if url and isinstance(url, str) and url.startswith("http"):
                 return url, data.get("name") or data.get("userName") or "User"
-        return None, "photoURL field not found in document"
+        return None, "photoURL field not found"
     except Exception as e:
         print(f"[Firebase Error] {e}")
         return None, str(e)
 
 
 def download_cloudinary(url):
-    try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Attendance-Face/1.0"})
-        r.raise_for_status()
-        arr = np.frombuffer(r.content, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError("Invalid image downloaded")
-        path = tmp_path("reg")
-        cv2.imwrite(path, img)
-        return resize_image(path)
-    except Exception as e:
-        print(f"[Download Error] {e}")
-        raise
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Attendance-Face/1.0"})
+    r.raise_for_status()
+    arr = np.frombuffer(r.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Invalid image")
+    path = tmp_path("reg")
+    cv2.imwrite(path, img)
+    return resize_image(path)
 
 
 # ===================== MAIN ROUTE =====================
@@ -160,8 +149,12 @@ def auto_verify():
         uid = (d.get('userId') or '').strip()
         frames = d.get('framesBase64') or []
 
-        if not uid or len(frames) < MIN_FRAMES:
-            return jsonify({'success': False, 'msg': 'userId and minimum 4 frames required'}), 400
+        print(f"[AUTO-VERIFY] UID: {uid} | Frames Received: {len(frames)}")
+
+        if not uid:
+            return jsonify({'success': False, 'msg': 'userId required'}), 400
+        if len(frames) < MIN_FRAMES:
+            return jsonify({'success': False, 'msg': f'Minimum {MIN_FRAMES} frames required'}), 400
 
         face_url, user_name = get_registered_face_info(uid)
         if not face_url:
@@ -180,13 +173,14 @@ def auto_verify():
 
         lap_scores = [laplacian_variance(p) for p in live_paths]
         avg_lap = sum(lap_scores) / len(lap_scores)
+        print(f"[LIVENESS] Avg Laplacian: {avg_lap:.2f}")
 
         if avg_lap < LAP_THRESHOLD:
             return jsonify({
                 'success': True,
                 'matched': False,
                 'live': False,
-                'msg': 'Photo or screen detected. Real face dikhao.'
+                'msg': 'Photo or screen detected. Real face use karein.'
             }), 200
 
         best_frame = live_paths[2] if len(live_paths) > 2 else live_paths[0]
@@ -207,7 +201,7 @@ def auto_verify():
                 'matched': False,
                 'live': True,
                 'confidence': confidence,
-                'msg': f'Face match nahi hua ({confidence}%). Better lighting try karein.'
+                'msg': f'Face match nahi hua ({confidence}%). Better lighting aur face position try karein.'
             })
 
     except Exception as e:
@@ -219,21 +213,12 @@ def auto_verify():
 
 @app.route('/')
 def index():
-    return jsonify({
-        'status': 'running',
-        'version': '5.5-memory-optimized',
-        'model': MODEL,
-        'message': 'Optimized for Render Free Tier (512MB)'
-    })
+    return jsonify({'status': 'running', 'version': '5.5-memory-optimized', 'min_frames': MIN_FRAMES})
 
 
 @app.route('/health')
 def health():
-    return jsonify({
-        'success': True,
-        'version': '5.5-memory-optimized',
-        'status': 'healthy'
-    })
+    return jsonify({'success': True, 'version': '5.5', 'status': 'healthy'})
 
 
 @app.route('/face/debug/<uid>')
@@ -250,8 +235,7 @@ def debug_user(uid):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 80)
-    print("🚀 MEMORY OPTIMIZED FACE SERVER v5.5")
-    print("   Model: SFace | Memory Optimized for Render Free")
-    print(f"   Port: {port}")
+    print("🚀 MEMORY OPTIMIZED SERVER v5.5 (SFace + 512MB Friendly)")
+    print(f"   Minimum Frames: {MIN_FRAMES}")
     print("=" * 80)
     app.run(host='0.0.0.0', port=port, debug=False)
