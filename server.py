@@ -12,7 +12,6 @@ from firebase_admin import credentials, firestore
 import gc
 import json
 from datetime import datetime
-from io import BytesIO
 
 app = Flask(__name__)
 CORS(app)
@@ -27,30 +26,48 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 FIRESTORE_COLLECTION = "users"
 
-print("="*80)
-print("SERVER STARTING - v6.0 (Cleaned)")
-print("="*80)
+print("=" * 80)
+print("SERVER STARTING - FINAL STABLE VERSION v7.0")
+print("=" * 80)
 
-# ===================== FIREBASE =====================
+# ===================== FIREBASE INIT =====================
 db = None
 firebase_status = "NOT_INITIALIZED"
 
-service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-if service_account_json:
-    try:
-        cred_dict = json.loads(service_account_json)
-        if "private_key" in cred_dict:
-            cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-        cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        firebase_status = "SUCCESS"
-        print("✅ Firebase Initialized Successfully")
-    except Exception as e:
-        firebase_status = f"ERROR: {e}"
-        print(f"❌ Firebase Error: {e}")
-else:
-    print("❌ FIREBASE_SERVICE_ACCOUNT_JSON not found")
+def init_firebase():
+    global db, firebase_status
+    service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+    if service_account_json:
+        try:
+            cred_dict = json.loads(service_account_json)
+            if "private_key" in cred_dict:
+                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            firebase_status = "SUCCESS"
+            print("✅ Firebase Initialized via Environment Variable")
+            return
+        except Exception as e:
+            print(f"❌ Firebase Env Error: {e}")
+
+    # Local development fallback
+    if os.path.exists("serviceAccountKey.json"):
+        try:
+            cred = credentials.Certificate("serviceAccountKey.json")
+            firebase_admin.initialize_app(cred)
+            db = firestore.client()
+            firebase_status = "SUCCESS (Local)"
+            print("✅ Firebase Initialized via Local File")
+            return
+        except Exception as e:
+            print(f"❌ Local File Error: {e}")
+
+    firebase_status = "DISABLED"
+    print("⚠️ Firebase Disabled - No credentials found")
+
+init_firebase()
 
 # ===================== HELPERS =====================
 def tmp_path(prefix='t'):
@@ -74,20 +91,22 @@ def save_b64(base64_str: str, path: str):
     except:
         return False
 
-def resize_image(path):
+def download_image(url: str):
     try:
-        img = cv2.imread(path)
+        if not url or not url.startswith("http"):
+            return None
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Attendance-Face/1.0"})
+        r.raise_for_status()
+        arr = np.frombuffer(r.content, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            return path
-        h, w = img.shape[:2]
-        if max(h, w) <= MAX_IMAGE_SIZE:
-            return path
-        scale = MAX_IMAGE_SIZE / max(h, w)
-        new_size = (int(w * scale), int(h * scale))
-        cv2.imwrite(path, cv2.resize(img, new_size))
+            return None
+        path = tmp_path("reg")
+        cv2.imwrite(path, img)
         return path
-    except:
-        return path
+    except Exception as e:
+        print(f"[Download Error] {str(e)[:80]}")
+        return None
 
 def laplacian_variance(path):
     try:
@@ -98,41 +117,31 @@ def laplacian_variance(path):
     except:
         return 0.0
 
-def get_registered_photo(uid: str):
-    """Firebase se photoURL fetch karta hai"""
-    if db is None:
-        return None, "Firebase not initialized"
+# ===================== ROUTES =====================
+
+@app.route('/face/register', methods=['POST'])
+def register_face():
+    """Sirf Firestore mein photoURL save karta hai"""
     try:
-        doc = db.collection(FIRESTORE_COLLECTION).document(uid).get()
-        if not doc.exists:
-            return None, "User not found"
+        data = request.json or {}
+        uid = (data.get('userId') or '').strip()
+        photo_url = data.get('photoURL', '')
 
-        data = doc.to_dict() or {}
-        for field in ["photoURL", "photoUrl", "faceURL", "faceImageUrl"]:
-            url = data.get(field)
-            if url and isinstance(url, str) and url.startswith("http"):
-                return url, data.get("name", "User")
-        return None, "photoURL not found in user document"
+        if not uid or not photo_url:
+            return jsonify({"success": False, "message": "userId and photoURL required"}), 400
+
+        if db:
+            db.collection(FIRESTORE_COLLECTION).document(uid).update({
+                "photoURL": photo_url,
+                "faceRegistered": True,
+                "updatedAt": datetime.now()
+            })
+
+        return jsonify({"success": True, "message": "Face URL saved", "photoURL": photo_url})
     except Exception as e:
-        return None, str(e)
+        return jsonify({"success": False, "message": str(e)}), 500
 
-def download_image(url: str):
-    """Cloudinary/Firebase Storage se image download karta hai"""
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "AttendanceApp/1.0"})
-        r.raise_for_status()
-        arr = np.frombuffer(r.content, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        path = tmp_path("reg")
-        cv2.imwrite(path, img)
-        return resize_image(path)
-    except Exception as e:
-        print(f"Download Error: {e}")
-        return None
 
-# ===================== MAIN ROUTE =====================
 @app.route('/face/auto-verify', methods=['POST'])
 def auto_verify():
     temp_paths = []
@@ -142,30 +151,19 @@ def auto_verify():
         frames = data.get('framesBase64') or []
         photo_url = data.get('photoURL') or ''
 
-        if not uid:
-            return jsonify({"success": False, "matched": False, "live": False, "msg": "userId required"}), 400
-        if len(frames) < 3:
-            return jsonify({"success": False, "matched": False, "live": False, "msg": "Need 3 frames"}), 400
+        if not uid or len(frames) < 3:
+            return jsonify({"success": False, "matched": False, "live": False, "msg": "Invalid request"}), 400
 
-        # Step 1: Registered photo download karo
-        reg_path = None
-        if photo_url:
-            reg_path = download_image(photo_url)
-        else:
-            # Fallback: Firebase se photoURL lo
-            url, _ = get_registered_photo(uid)
-            if url:
-                reg_path = download_image(url)
-
+        # Download registered image (Cloudinary se)
+        reg_path = download_image(photo_url)
         if not reg_path:
             return jsonify({"success": False, "matched": False, "live": False, "msg": "Registered face not found"}), 400
-
         temp_paths.append(reg_path)
 
-        # Step 2: Frames save karo
+        # Save frames
         frame_paths = []
         for i, b64 in enumerate(frames[:3]):
-            p = tmp_path(f'frame_{i}')
+            p = tmp_path(f'f{i}')
             if save_b64(b64, p):
                 frame_paths.append(p)
                 temp_paths.append(p)
@@ -174,48 +172,26 @@ def auto_verify():
             cleanup(*temp_paths)
             return jsonify({"success": False, "matched": False, "live": False, "msg": "Frame saving failed"}), 400
 
-        # Step 3: Face detection + Liveness checks
-        face_boxes = []
+        # Face Detection
         for i, p in enumerate(frame_paths):
-            try:
-                faces = DeepFace.extract_faces(img_path=p, detector_backend=BACKEND, enforce_detection=False)
-                valid = [f for f in faces if float(f.get('confidence', 0)) > 0.5]
-                if len(valid) != 1:
-                    cleanup(*temp_paths)
-                    return jsonify({"success": False, "matched": False, "live": False, "msg": f"Frame {i+1}: Exactly 1 face required"}), 400
-                fa = valid[0]['facial_area']
-                face_boxes.append(fa)
-            except Exception as e:
+            faces = DeepFace.extract_faces(img_path=p, detector_backend=BACKEND, enforce_detection=False)
+            valid = [f for f in faces if float(f.get('confidence', 0)) > 0.5]
+            if len(valid) != 1:
                 cleanup(*temp_paths)
-                return jsonify({"success": False, "matched": False, "live": False, "msg": f"Face detection error: {str(e)}"}), 500
+                return jsonify({"success": False, "matched": False, "live": False, "msg": f"Frame {i+1}: Exactly 1 face required"}), 400
 
-        # Movement check (anti-static)
-        movements = []
-        for i in range(len(face_boxes) - 1):
-            dx = abs(face_boxes[i]['x'] - face_boxes[i+1]['x'])
-            dy = abs(face_boxes[i]['y'] - face_boxes[i+1]['y'])
-            movements.append(dx + dy)
-
-        avg_movement = sum(movements) / len(movements) if movements else 0
-        if avg_movement < 2:
-            cleanup(*temp_paths)
-            return jsonify({"success": True, "matched": False, "live": False, "msg": "Static image detected"}), 200
-
-        # Texture check
+        # Liveness Check (Texture)
         lap_scores = [laplacian_variance(p) for p in frame_paths]
         avg_lap = sum(lap_scores) / len(lap_scores)
         if avg_lap < 40:
             cleanup(*temp_paths)
             return jsonify({"success": True, "matched": False, "live": False, "msg": "Flat image detected"}), 200
 
-        # Step 4: Face Match (middle frame use karo)
+        # Face Matching
         best_frame = frame_paths[1]
         result = DeepFace.verify(
-            img1_path=reg_path,
-            img2_path=best_frame,
-            model_name=MODEL,
-            detector_backend=BACKEND,
-            enforce_detection=False
+            img1_path=reg_path, img2_path=best_frame,
+            model_name=MODEL, detector_backend=BACKEND, enforce_detection=False
         )
 
         matched = bool(result.get('verified', False))
@@ -227,19 +203,13 @@ def auto_verify():
 
         if not matched:
             return jsonify({
-                "success": True,
-                "matched": False,
-                "live": True,
-                "confidence": confidence,
-                "msg": f"Face not matched ({confidence}%)"
+                "success": True, "matched": False, "live": True,
+                "confidence": confidence, "msg": f"Face not matched ({confidence}%)"
             })
 
         return jsonify({
-            "success": True,
-            "matched": True,
-            "live": True,
-            "confidence": confidence,
-            "msg": f"Verified successfully ({confidence}%)"
+            "success": True, "matched": True, "live": True,
+            "confidence": confidence, "msg": f"Verified successfully ({confidence}%)"
         })
 
     except Exception as e:
@@ -247,15 +217,16 @@ def auto_verify():
         cleanup(*temp_paths)
         return jsonify({"success": False, "matched": False, "live": False, "msg": str(e)}), 500
 
-# ===================== HEALTH =====================
+
 @app.route('/')
 def index():
     return jsonify({
         "status": "running",
-        "version": "6.0",
+        "version": "7.0-final",
         "firebase": firebase_status
     })
 
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
