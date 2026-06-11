@@ -1,29 +1,3 @@
-# flask==3.0.3
-# flask-cors==4.0.1
-# gunicorn==22.0.0
-# gevent==24.2.1
-# deepface==0.0.93
-# tensorflow-cpu==2.17.0
-# tf-keras==2.17.0
-# opencv-python-headless==4.10.0.84
-# numpy==1.26.4
-# requests==2.32.3
-# firebase-admin==6.5.0
-# protobuf==3.20.3
-# Pillow==10.4.0
-
-# Flask
-# flask-cors
-# deepface
-# opencv-python-headless
-# numpy
-# requests
-# firebase-admin
-# Pillow
-# gunicorn
-# tensorflow
-# tf-keras
-
 Flask==3.0.3
 flask-cors==5.0.0
 deepface==0.0.93
@@ -35,4 +9,3 @@ Pillow==10.4.0
 gunicorn==22.0.0
 tensorflow-cpu==2.16.1
 tf-keras==2.16.0
-
