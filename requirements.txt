@@ -12,7 +12,6 @@
 # protobuf==3.20.3
 # Pillow==10.4.0
 
-
 Flask
 flask-cors
 deepface
@@ -24,3 +23,6 @@ Pillow
 gunicorn
 tensorflow
 tf-keras
+
+
+
