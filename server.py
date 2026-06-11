@@ -7,7 +7,6 @@ import base64
 import gc
 import json
 import uuid
-import traceback
 from io import BytesIO
 from datetime import datetime
 
@@ -29,16 +28,13 @@ TMP_DIR = "temp_files"
 FIRESTORE_COLLECTION = "users"
 MAX_IMAGE_SIZE = 512
 MIN_FRAMES = 3
-
-# stronger liveness thresholds
-MIN_MOVEMENT = 4.0
-MIN_LAPLACIAN = 45.0
-MIN_ANTISPOOF_SCORE = 0.70  # if score available
+MIN_MOVEMENT = 1.0
+MIN_LAPLACIAN = 35.0
 
 os.makedirs(TMP_DIR, exist_ok=True)
 
 print("=" * 80)
-print("SERVER STARTING - FINAL LIVENESS FACE SERVER")
+print("SERVER STARTING - MEMORY OPTIMIZED FACE SERVER")
 print("=" * 80)
 
 # ===================== FIREBASE INIT =====================
@@ -137,7 +133,6 @@ def save_b64(base64_str: str, path: str):
         if not base64_str:
             return False
 
-        # support data:image/...;base64,...
         if "," in base64_str and "base64" in base64_str[:60]:
             base64_str = base64_str.split(",", 1)[1]
 
@@ -198,9 +193,6 @@ def get_registered_photo_url(uid: str):
         return None, f"Firestore error: {str(e)}"
 
 def normalize_cloudinary_url(url: str):
-    """
-    Cloudinary URL ko JPG-friendly banata hai.
-    """
     try:
         if not url or "res.cloudinary.com" not in url or "/upload/" not in url:
             return url
@@ -226,10 +218,6 @@ def normalize_cloudinary_url(url: str):
         return url
 
 def download_image(url: str):
-    """
-    URL se image download karke local JPG save karta hai.
-    Returns: (path, error)
-    """
     try:
         if not isinstance(url, str) or not url.strip().startswith("http"):
             return None, "Invalid or empty URL"
@@ -251,7 +239,6 @@ def download_image(url: str):
         content_type = r.headers.get("Content-Type", "")
         print(f"[DOWNLOAD] content-type={content_type}, size={len(r.content)}")
 
-        # PIL first
         try:
             img = Image.open(BytesIO(r.content)).convert("RGB")
             path = tmp_path("reg")
@@ -260,7 +247,6 @@ def download_image(url: str):
         except Exception as pil_err:
             print(f"[DOWNLOAD] PIL failed: {pil_err}")
 
-        # OpenCV fallback
         try:
             arr = np.frombuffer(r.content, np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -279,9 +265,6 @@ def download_image(url: str):
         return None, str(e)
 
 def extract_single_face_box_cv(path: str):
-    """
-    Lightweight face detection using OpenCV Haar Cascade
-    """
     try:
         img = cv2.imread(path)
         if img is None:
@@ -302,54 +285,6 @@ def extract_single_face_box_cv(path: str):
         return {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}, None
     except Exception as e:
         return None, str(e)
-
-def anti_spoof_check(path: str):
-    """
-    DeepFace anti-spoofing check
-    Returns:
-      (is_real, score, err)
-    """
-    try:
-        DeepFace, _ = get_deepface()
-
-        faces = None
-
-        # different DeepFace versions may use different param names
-        try:
-            faces = DeepFace.extract_faces(
-                img_path=path,
-                detector_backend="opencv",
-                enforce_detection=False,
-                anti_spoofing=True
-            )
-        except TypeError:
-            try:
-                faces = DeepFace.extract_faces(
-                    img_path=path,
-                    detector_backend="opencv",
-                    enforce_detection=False,
-                    anti_spoof=True
-                )
-            except TypeError:
-                return None, 0.0, "DeepFace anti-spoofing not supported in this version"
-
-        valid = [f for f in faces if float(f.get("confidence", 0)) > 0.5]
-
-        if len(valid) != 1:
-            return False, 0.0, f"Expected 1 face, found {len(valid)}"
-
-        face = valid[0]
-
-        is_real = face.get("is_real", None)
-        score = float(face.get("antispoof_score", 0) or 0)
-
-        if is_real is None:
-            return None, score, "anti-spoof result missing"
-
-        return bool(is_real), score, None
-
-    except Exception as e:
-        return None, 0.0, str(e)
 
 def verify_face_match(reg_path: str, live_path: str):
     try:
@@ -392,7 +327,7 @@ def internal_error(e):
 def index():
     return jsonify({
         "status": "running",
-        "version": "final-liveness-face-server",
+        "version": "memory-optimized-face-server",
         "firebase": firebase_status,
         "time": datetime.utcnow().isoformat()
     })
@@ -408,9 +343,6 @@ def health():
 
 @app.route("/face/register", methods=["POST"])
 def register_face():
-    """
-    Sirf Cloudinary photoURL ko Firestore me save/update karega.
-    """
     test_path = None
     try:
         data = request.json or {}
@@ -440,7 +372,7 @@ def register_face():
         db.collection(FIRESTORE_COLLECTION).document(uid).set({
             "photoURL": photo_url,
             "faceRegistered": True,
-            "updatedAt": firestore.SERVER_TIMESTAMP
+            "updatedAt": datetime.utcnow()
         }, merge=True)
 
         return jsonify({
@@ -522,10 +454,8 @@ def auto_verify():
                 "msg": f"Need at least {MIN_FRAMES} frames"
             }), 400
 
-        # request photoURL preferred
         photo_url = incoming_photo_url
 
-        # Firestore fallback
         if not photo_url:
             photo_url, photo_err = get_registered_photo_url(uid)
             print(f"[AUTO_VERIFY] firestore photo_url={photo_url}")
@@ -537,7 +467,6 @@ def auto_verify():
                     "msg": f"Registered face not found: {photo_err}"
                 }), 400
 
-        # download registered image
         reg_path, reg_err = download_image(photo_url)
         if not reg_path:
             return jsonify({
@@ -550,7 +479,6 @@ def auto_verify():
 
         temp_paths.append(reg_path)
 
-        # save frames
         frame_paths = []
         for i, b64 in enumerate(frames[:MIN_FRAMES]):
             p = tmp_path(f"frame_{i}")
@@ -567,7 +495,7 @@ def auto_verify():
                 "msg": "Frame saving failed"
             }), 400
 
-        # each frame must have exactly 1 face
+        # face detection using OpenCV instead of DeepFace.extract_faces
         face_boxes = []
         for i, p in enumerate(frame_paths):
             box, err = extract_single_face_box_cv(p)
@@ -613,47 +541,8 @@ def auto_verify():
                 "msg": "Flat image detected. Real person required."
             }), 200
 
-        # strong anti-spoofing
+        # match using middle frame
         best_frame = frame_paths[1] if len(frame_paths) >= 2 else frame_paths[0]
-        anti_frames = [frame_paths[0], best_frame]
-
-        anti_scores = []
-        for idx, fpath in enumerate(anti_frames):
-            is_real, anti_score, anti_err = anti_spoof_check(fpath)
-            print(f"[ANTI_SPOOF] frame={idx+1}, is_real={is_real}, score={anti_score}, err={anti_err}")
-
-            if is_real is None:
-                return jsonify({
-                    "success": False,
-                    "matched": False,
-                    "live": False,
-                    "msg": f"Anti-spoof engine error: {anti_err}"
-                }), 500
-
-            if is_real is False:
-                return jsonify({
-                    "success": True,
-                    "matched": False,
-                    "live": False,
-                    "confidence": 0,
-                    "msg": "Screen/photo spoof detected. Please use live face only."
-                }), 200
-
-            anti_scores.append(float(anti_score or 0))
-
-        avg_anti_score = round(sum(anti_scores) / len(anti_scores), 3) if anti_scores else 0
-        print(f"[ANTI_SPOOF] avg_score={avg_anti_score}")
-
-        if avg_anti_score and avg_anti_score < MIN_ANTISPOOF_SCORE:
-            return jsonify({
-                "success": True,
-                "matched": False,
-                "live": False,
-                "confidence": 0,
-                "msg": "Anti-spoof confidence too low. Please use live face."
-            }), 200
-
-        # final face match
         matched, confidence, raw_result = verify_face_match(reg_path, best_frame)
 
         print(f"[AUTO_VERIFY] matched={matched}, confidence={confidence}")
@@ -665,7 +554,6 @@ def auto_verify():
                 "matched": False,
                 "live": True,
                 "confidence": confidence,
-                "livenessScore": avg_anti_score,
                 "msg": f"Face not matched ({confidence}%)"
             }), 200
 
@@ -674,12 +562,12 @@ def auto_verify():
             "matched": True,
             "live": True,
             "confidence": confidence,
-            "livenessScore": avg_anti_score,
             "msg": f"Verified successfully ({confidence}%)",
             "time": datetime.utcnow().isoformat()
         }), 200
 
     except Exception as e:
+        import traceback
         print(f"[AUTO_VERIFY CRASH] {e}")
         traceback.print_exc()
         return jsonify({
@@ -695,4 +583,3 @@ def auto_verify():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
