@@ -7,6 +7,7 @@ import base64
 import gc
 import json
 import uuid
+import traceback
 from io import BytesIO
 from datetime import datetime
 
@@ -25,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
 # ===================== CONFIG =====================
 MODEL = "SFace"
 TMP_DIR = "temp_files"
-FIRESTORE_COLLECTION = "users"
+FIRESTORE_USER_COLLECTION = "users"
 MAX_IMAGE_SIZE = 512
 MIN_FRAMES = 3
 MIN_MOVEMENT = 1.0
@@ -34,7 +35,7 @@ MIN_LAPLACIAN = 35.0
 os.makedirs(TMP_DIR, exist_ok=True)
 
 print("=" * 80)
-print("SERVER STARTING - MEMORY OPTIMIZED FACE SERVER")
+print("SERVER STARTING - FACE VERIFY SERVER (RESTRUCTURED)")
 print("=" * 80)
 
 # ===================== FIREBASE INIT =====================
@@ -115,6 +116,25 @@ def release_tf_memory():
 CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
+# ===================== RESPONSE HELPERS =====================
+def ok(data=None, status=200):
+    payload = {"success": True}
+    if data:
+        payload.update(data)
+    return jsonify(payload), status
+
+def fail(message="Error", status=400, matched=False, live=False, extra=None):
+    payload = {
+        "success": False,
+        "matched": matched,
+        "live": live,
+        "message": message,
+        "msg": message,
+    }
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), status
+
 # ===================== HELPERS =====================
 def tmp_path(prefix="t"):
     return os.path.join(TMP_DIR, f"{prefix}_{uuid.uuid4().hex[:10]}.jpg")
@@ -172,16 +192,22 @@ def laplacian_variance(path):
     except:
         return 0.0
 
-def get_registered_photo_url(uid: str):
+def get_registered_photo_url(uid: str, org_id: str = ""):
     if db is None:
         return None, "Firestore not initialized"
 
     try:
-        doc = db.collection(FIRESTORE_COLLECTION).document(uid).get()
-        if not doc.exists:
+        doc_ref = db.collection(FIRESTORE_USER_COLLECTION).document(uid)
+        snap = doc_ref.get()
+
+        if not snap.exists:
             return None, "User document not found"
 
-        data = doc.to_dict() or {}
+        data = snap.to_dict() or {}
+
+        # Optional org validation for future multi-tenant support
+        if org_id and data.get("orgId") and data.get("orgId") != org_id:
+            return None, "User does not belong to requested organization"
 
         for key in ["photoURL", "photoUrl", "imageUrl", "cloudinaryUrl", "faceURL", "faceImageUrl"]:
             val = data.get(key)
@@ -253,8 +279,8 @@ def download_image(url: str):
             if img is None:
                 return None, f"Decode failed. content-type={content_type}"
             path = tmp_path("reg")
-            ok = cv2.imwrite(path, img)
-            if not ok:
+            ok_write = cv2.imwrite(path, img)
+            if not ok_write:
                 return None, "Failed to write image"
             return resize_image(path), None
         except Exception as cv_err:
@@ -310,32 +336,25 @@ def verify_face_match(reg_path: str, live_path: str):
 # ===================== ERROR HANDLERS =====================
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({
-        "success": False,
-        "message": "Route not found"
-    }), 404
+    return fail("Route not found", 404)
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify({
-        "success": False,
-        "message": "Internal server error"
-    }), 500
+    return fail("Internal server error", 500)
 
 # ===================== ROUTES =====================
 @app.route("/")
 def index():
-    return jsonify({
+    return ok({
         "status": "running",
-        "version": "memory-optimized-face-server",
+        "version": "face-server-restructured-v1",
         "firebase": firebase_status,
         "time": datetime.utcnow().isoformat()
     })
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "success": True,
+    return ok({
         "status": "ok",
         "firebase": firebase_status,
         "time": datetime.utcnow().isoformat()
@@ -349,42 +368,44 @@ def register_face():
         uid = (data.get("userId") or "").strip()
         photo_url = (data.get("photoURL") or "").strip()
 
+        # future multi-tenant metadata
+        org_id = (data.get("orgId") or "").strip()
+        org_name = (data.get("orgName") or "").strip()
+        admin_id = (data.get("adminId") or "").strip()
+
         if not uid or not photo_url:
-            return jsonify({
-                "success": False,
-                "message": "userId and photoURL required"
-            }), 400
+            return fail("userId and photoURL required", 400)
 
         if db is None:
-            return jsonify({
-                "success": False,
-                "message": "Firestore not initialized"
-            }), 500
+            return fail("Firestore not initialized", 500)
 
         # optional validation
         test_path, dl_err = download_image(photo_url)
         if not test_path:
-            return jsonify({
-                "success": False,
-                "message": f"photoURL download failed: {dl_err}"
-            }), 400
+            return fail(f"photoURL download failed: {dl_err}", 400)
 
-        db.collection(FIRESTORE_COLLECTION).document(uid).set({
+        payload = {
             "photoURL": photo_url,
             "faceRegistered": True,
-            "updatedAt": datetime.utcnow()
-        }, merge=True)
+            "updatedAt": datetime.utcnow(),
+        }
 
-        return jsonify({
-            "success": True,
+        # only if provided
+        if org_id:
+            payload["orgId"] = org_id
+        if org_name:
+            payload["orgName"] = org_name
+        if admin_id:
+            payload["adminId"] = admin_id
+
+        db.collection(FIRESTORE_USER_COLLECTION).document(uid).set(payload, merge=True)
+
+        return ok({
             "message": "photoURL saved successfully",
             "photoURL": photo_url
         })
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": str(e)
-        }), 500
+        return fail(str(e), 500)
     finally:
         cleanup(test_path)
 
@@ -393,33 +414,27 @@ def debug_photo(uid):
     test_path = None
     try:
         uid = (uid or "").strip()
-        if not uid:
-            return jsonify({"success": False, "message": "uid required"}), 400
+        org_id = (request.args.get("orgId") or "").strip()
 
-        photo_url, err = get_registered_photo_url(uid)
+        if not uid:
+            return fail("uid required", 400)
+
+        photo_url, err = get_registered_photo_url(uid, org_id)
         if not photo_url:
-            return jsonify({
-                "success": False,
-                "firebase": firebase_status,
-                "message": err
-            }), 404
+            return fail(err, 404, extra={"firebase": firebase_status})
 
         test_path, dl_err = download_image(photo_url)
-        ok = bool(test_path)
+        ok_download = bool(test_path)
 
-        return jsonify({
-            "success": True,
+        return ok({
             "firebase": firebase_status,
             "photoURL": photo_url,
             "normalizedURL": normalize_cloudinary_url(photo_url),
-            "downloadOk": ok,
+            "downloadOk": ok_download,
             "downloadError": dl_err
         })
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": str(e)
-        }), 500
+        return fail(str(e), 500)
     finally:
         cleanup(test_path)
 
@@ -432,50 +447,36 @@ def auto_verify():
         uid = (data.get("userId") or "").strip()
         frames = data.get("framesBase64") or []
         incoming_photo_url = (data.get("photoURL") or "").strip()
+        org_id = (data.get("orgId") or "").strip()  # future-safe
 
         print("=" * 60)
         print(f"[AUTO_VERIFY] uid={uid}")
+        print(f"[AUTO_VERIFY] orgId={org_id}")
         print(f"[AUTO_VERIFY] frames={len(frames)}")
         print(f"[AUTO_VERIFY] request_photo_exists={bool(incoming_photo_url)}")
 
         if not uid:
-            return jsonify({
-                "success": False,
-                "matched": False,
-                "live": False,
-                "msg": "userId required"
-            }), 400
+            return fail("userId required", 400)
 
         if len(frames) < MIN_FRAMES:
-            return jsonify({
-                "success": False,
-                "matched": False,
-                "live": False,
-                "msg": f"Need at least {MIN_FRAMES} frames"
-            }), 400
+            return fail(f"Need at least {MIN_FRAMES} frames", 400)
 
         photo_url = incoming_photo_url
 
+        # fallback from firestore
         if not photo_url:
-            photo_url, photo_err = get_registered_photo_url(uid)
+            photo_url, photo_err = get_registered_photo_url(uid, org_id)
             print(f"[AUTO_VERIFY] firestore photo_url={photo_url}")
             if not photo_url:
-                return jsonify({
-                    "success": False,
-                    "matched": False,
-                    "live": False,
-                    "msg": f"Registered face not found: {photo_err}"
-                }), 400
+                return fail(f"Registered face not found: {photo_err}", 400)
 
         reg_path, reg_err = download_image(photo_url)
         if not reg_path:
-            return jsonify({
-                "success": False,
-                "matched": False,
-                "live": False,
-                "msg": f"Registered face download failed: {reg_err}",
-                "photoURL": photo_url[:200]
-            }), 400
+            return fail(
+                f"Registered face download failed: {reg_err}",
+                400,
+                extra={"photoURL": photo_url[:200]}
+            )
 
         temp_paths.append(reg_path)
 
@@ -488,24 +489,14 @@ def auto_verify():
                 temp_paths.append(p)
 
         if len(frame_paths) < MIN_FRAMES:
-            return jsonify({
-                "success": False,
-                "matched": False,
-                "live": False,
-                "msg": "Frame saving failed"
-            }), 400
+            return fail("Frame saving failed", 400)
 
-        # face detection using OpenCV instead of DeepFace.extract_faces
+        # lightweight face detection
         face_boxes = []
         for i, p in enumerate(frame_paths):
             box, err = extract_single_face_box_cv(p)
             if not box:
-                return jsonify({
-                    "success": False,
-                    "matched": False,
-                    "live": False,
-                    "msg": f"Frame {i+1}: {err}"
-                }), 400
+                return fail(f"Frame {i+1}: {err}", 400)
             face_boxes.append(box)
 
         # movement check
@@ -525,6 +516,7 @@ def auto_verify():
                 "success": True,
                 "matched": False,
                 "live": False,
+                "confidence": 0,
                 "msg": "Static image detected. Please use live face."
             }), 200
 
@@ -538,10 +530,11 @@ def auto_verify():
                 "success": True,
                 "matched": False,
                 "live": False,
+                "confidence": 0,
                 "msg": "Flat image detected. Real person required."
             }), 200
 
-        # match using middle frame
+        # face match
         best_frame = frame_paths[1] if len(frame_paths) >= 2 else frame_paths[0]
         matched, confidence, raw_result = verify_face_match(reg_path, best_frame)
 
@@ -567,15 +560,9 @@ def auto_verify():
         }), 200
 
     except Exception as e:
-        import traceback
         print(f"[AUTO_VERIFY CRASH] {e}")
         traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "matched": False,
-            "live": False,
-            "msg": f"Server error: {str(e)}"
-        }), 500
+        return fail(f"Server error: {str(e)}", 500)
     finally:
         cleanup(*temp_paths)
         release_tf_memory()
